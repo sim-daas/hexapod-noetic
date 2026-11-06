@@ -41,8 +41,18 @@ are accel (3), gyro (3) and projected gravity (3). Open items for the MPU6050 in
 - **Platform:** Raspberry Pi 4 Model B Rev 1.4, 4 cores, 1.5 GHz, Ubuntu 20.04, Python 3.8.10, numpy 1.22.0,
   onnxruntime 1.16.3 (CPU EP, installed with `pip3 install --user onnxruntime`). Governor: ondemand. The ROS stack
   was not running.
-- Export and benchmark scripts were written in the session scratchpad. They are not in this repo yet, and the
-  bundle is on the Pi at `~/s1h_bench/`.
+- Scripts are in `tools/s1_export/`. The export scripts run on the workstation in `env_isaaclab` and the bench
+  scripts on the Pi. The bundle that was benchmarked is on the Pi at `~/s1h_bench/`.
+  ```bash
+  # workstation: <out> gets aux.onnx, actor.onnx, control.onnx and the sample-I/O npz files
+  python tools/s1_export/export_s1h.py <model.pt> <out>
+  python tools/s1_export/export_fused.py <model.pt> <out>
+  # bench_pi.py also needs <out>/kin_consts.npz and vkin_ref.npz (written by a one-off snippet in this session,
+  # not in a script yet); bench_fused.py needs only control.onnx + fused_io.npz
+  cp tools/s1_export/bench_*.py <out>/ && rsync -az -e 'ssh -p 2222' <out>/ pibot@127.0.0.1:~/s1h_bench/
+  # Pi
+  python3 ~/s1h_bench/bench_fused.py 3000
+  ```
   - `export_s1h.py` exports `aux.onnx` (TCN + Δv̂ + f̂) and `actor.onnx` (rsl_rl `as_onnx`, normaliser folded in).
   - `export_fused.py` exports `control.onnx`: inputs `hist (1,50,111)` raw frames and `obs_base (1,1269)`, output
     `action (18)`.
@@ -77,10 +87,39 @@ are accel (3), gyro (3) and projected gravity (3). Open items for the MPU6050 in
   budget.
 
 ### Remaining before a first hardware run
-- MPU6050 mounted, driver, attitude filter for gravity, frame alignment (above).
+- MPU6050 frame alignment (match sim base_link: +x forward, +y left, +z up), static bias calibration, attitude filter for projected gravity.
 - Raise the joint-state rate to ≥ 50 Hz (or read the bus directly) and measure real bus time per step.
 - A NumPy port of hexasim `mdp/proprio.py` (`ProprioReader`): quantisation, ZOH on dropped reads, two-sample q̇,
   validity mask.
 - The ROS runner itself (obs assembly, `control.onnx`, name-mapped `JointGroupCommand`, clip, start-up ramp from
   sleep pose to the rest pose, torque-off path, logging).
 - Verify each joint's sign convention by name on the stand.
+
+## 2026-11-05: MPU-6050 hardware attach and live verification
+
+### Wiring and Electrical Safety
+- **Device:** MPU-6050 (GY-521 breakout board).
+- **Voltage Safety:** BCM2711 GPIOs on Pi 4 are strictly 3.3V only (not 5V tolerant). Breakout VCC was connected to Pi **3.3V (Pin 1)**, not 5V. At ~3.8 mA current draw, LDO dropout is < 40 mV (~3.26V rail), keeping SDA, SCL, and INT strictly within 3.3V logic limits without risk of 5V pull-up leakage.
+- **Pinout configured:**
+  - VCC -> RPi Pin 1 (3.3V)
+  - GND -> RPi Pin 9 (GND)
+  - SDA -> RPi Pin 3 (GPIO 2 / SDA1)
+  - SCL -> RPi Pin 5 (GPIO 3 / SCL1)
+  - AD0 -> RPi Pin 9 / GND (sets I2C address to `0x68`)
+  - XDA, XCL -> Floating (auxiliary master bus, unused)
+
+### System Configuration
+- Configured persistent udev rule on Pi `/etc/udev/rules.d/99-i2c.rules`:
+  ```udev
+  KERNEL=="i2c-[0-9]*", GROUP="dialout", MODE="0666"
+  ```
+  This grants user `pibot` direct access to `/dev/i2c-1` without `sudo`.
+
+### Bus Verification & Live Motion Test
+- Bus probe on `/dev/i2c-1` identified device at address `0x68`.
+- `WHO_AM_I` register (`0x75`) read confirmed `0x68`.
+- Initialized power management (`PWR_MGMT_1 = 0x01` PLL with X-gyro clock) and configured scales: $\pm 4\text{ g}$, $\pm 500^\circ/\text{s}$.
+- Burst-read 14 bytes (`0x3B`–`0x48`) in a single I2C transaction over 40 steps (~4 seconds) while moving the sensor:
+  - Dynamic acceleration tracked between $0.77\text{ g}$ and $1.35\text{ g}$ (nominal baseline $\|a\| \approx 1.0\text{ g}$).
+  - Gyroscope responded dynamically across all 3 axes (rates reaching $-68^\circ/\text{s}$ to $+74^\circ/\text{s}$).
+  - Sensor is fully operational and responsive over I2C.
