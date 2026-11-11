@@ -1,0 +1,24 @@
+{
+ "captured": "2026-11-06 09:49:57",
+ "note": "relaxed belly-down pose with torque off, read from the servos",
+ "q": {
+  "right_front_coxa": 0.0107,
+  "right_middle_coxa": 0.0123,
+  "right_back_coxa": -0.0061,
+  "left_front_coxa": 0.0123,
+  "left_middle_coxa": -0.0107,
+  "left_back_coxa": -0.0077,
+  "right_front_femur": -1.468,
+  "right_middle_femur": -1.5708,
+  "right_back_femur": -1.4404,
+  "left_front_femur": -1.2026,
+  "left_middle_femur": -1.4082,
+  "left_back_femur": -1.4557,
+  "right_front_tibia": 1.1796,
+  "right_middle_tibia": 1.1536,
+  "right_back_tibia": 1.1766,
+  "left_front_tibia": 0.7194,
+  "left_middle_tibia": 1.1766,
+  "left_back_tibia": 1.1597
+ }
+}

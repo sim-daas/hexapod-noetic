@@ -6,3 +6,6 @@ __pycache__/
 
 # Local hardware access notes
 HARDWARE_ACCESS.md
+
+# Recorded IMU motion-check sessions
+tools/imu/logs/
