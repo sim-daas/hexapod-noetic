@@ -55,6 +55,8 @@ CONFIRM_S = 3.0
 CMD_GATE_S = 0.2
 SIGN_PULSE = 0.15
 ESC = "\x1b"
+IMU_WAIT_S = 0.004  # worker-thread IMU read: give up (= missed IMU sample) after this; a read takes 1.7 ms at 100 kHz
+HEALTH_LATE_S = 0.016  # skip this step's health read (~1.2 ms) if the step has already used this much of its 20 ms
 
 
 def hold(q, seconds, name="hold"):
@@ -76,10 +78,21 @@ class Command:
         self.turn_lo = c["turn_yaw_range"][0]
         self.vx_max = min(vx_max, self.vx_hi)
         self.wz_max = min(wz_max, self.wz_hi)
+        self.walk_lo = self.vx_lo  # slowest walking command (the trained minimum unless fine())
         self.vx_steps = [0.0] + [round(v, 4) for v in np.arange(self.vx_lo, self.vx_max + 1e-9, 0.025)]
         self.vx_i, self.vy, self.wz = 0, 0.0, 0.0
         self.applied = np.zeros(3)
         self.t_applied = -1e9
+        self.ramp_s, self.t_last = 0.0, None
+
+    def fine(self, walk_lo=0.02, ramp_s=1.0):
+        """Opt-in gentler teleop: speed steps 0, 0.02, 0.03, 0.04 below the trained minimum (sim: cmd 0.025 -> 0.021 m/s
+        achieved), then the usual 0.025 grid; and the applied command ramps towards the target (full 0.05 m/s step
+        in ramp_s) instead of jumping. Walking starts at walk_lo; stop (space) stays immediate."""
+        self.walk_lo = walk_lo
+        low = [round(float(v), 4) for v in np.arange(walk_lo, self.vx_lo - 1e-9, 0.01)]
+        self.vx_steps = [0.0] + low + [round(float(v), 4) for v in np.arange(self.vx_lo, self.vx_max + 1e-9, 0.025)]
+        self.ramp_s = ramp_s
 
     @property
     def target(self):
@@ -87,7 +100,7 @@ class Command:
 
     def snap(self, vx, vy, wz):
         vx = float(np.clip(vx, 0.0, self.vx_max))
-        if vx < self.vx_lo:  # standing or turn on the spot
+        if vx < self.walk_lo:  # standing or turn on the spot
             vx, vy = 0.0, 0.0
             if abs(wz) > 1e-6:
                 wz = float(np.sign(wz) * np.clip(abs(wz), self.turn_lo, self.wz_max))
@@ -103,7 +116,7 @@ class Command:
             self.vx_i = min(self.vx_i + 1, len(self.vx_steps) - 1)
         elif k == "s":
             self.vx_i = max(self.vx_i - 1, 0)
-        elif k in ("a", "d") and self.vx_steps[self.vx_i] >= self.vx_lo:
+        elif k in ("a", "d") and self.vx_steps[self.vx_i] >= self.walk_lo:
             self.vy = float(np.clip(self.vy + (0.025 if k == "a" else -0.025), -self.vy_hi, self.vy_hi))
         elif k in ("q", "e"):
             self.wz = float(np.clip(self.wz + (0.1 if k == "q" else -0.1), -self.wz_max, self.wz_max))
@@ -114,15 +127,31 @@ class Command:
             self.t_applied = -1e9  # stop applies immediately
         else:
             return False
-        if self.vx_steps[self.vx_i] < self.vx_lo:
+        if self.vx_steps[self.vx_i] < self.walk_lo:
             self.vy = 0.0
         return True
+
+    def _ramp(self, tgt, t):
+        dt = 0.0 if self.t_last is None else min(0.1, max(0.0, t - self.t_last))  # cap: no jump after a pause
+        self.t_last = t
+        if self.t_applied < -1e8 or not tgt.any():  # stop / zero command: immediate
+            self.applied, self.t_applied = tgt.copy(), t
+            return self.applied
+        cur = self.applied.copy()
+        if cur[0] < self.walk_lo and tgt[0] >= self.walk_lo:  # start walking at the slowest step, not from 0
+            cur[0] = self.walk_lo
+        rate = np.array([0.05, 0.05, 0.2]) / self.ramp_s * dt  # m/s, m/s, rad/s per s
+        new = cur + np.clip(tgt - cur, -rate, rate)
+        self.applied = self.snap(*new)
+        return self.applied
 
     def zero(self):
         self.vx_i, self.vy, self.wz = 0, 0.0, 0.0
 
     def update(self, t):
         tgt = self.target
+        if self.ramp_s > 0:
+            return self._ramp(tgt, t)
         if not np.allclose(tgt, self.applied) and t - self.t_applied >= CMD_GATE_S:
             self.applied = tgt
             self.t_applied = t
@@ -228,7 +257,7 @@ class FakeImu:
 # ---------------------------------------------------------------------------------------------------- runner
 class Runner:
     def __init__(self, contract, bus, imu, imu_block, policy, vx_max=0.10, wz_max=0.2, clock=time.monotonic,
-                 out=sys.stdout, log=None):
+                 out=sys.stdout, log=None, imu_thread=False):
         self.c, self.bus, self.imu, self.blk, self.policy = contract, bus, imu, imu_block, policy
         self.clock, self.out = clock, out
         self.log = log or Log("", enabled=False)
@@ -238,6 +267,11 @@ class Runner:
         self.reader_init = False
         self.safety = Safety(18, contract.dt)
         self.cmd = Command(contract, vx_max, wz_max)
+        # Deploy-side command shaping (all off by default = the sim-faithful path). soft_start s: blend the policy
+        # target from STAND to full over this time; rate_limit rad/s: per-joint cap on the q_cmd change per step;
+        # policy_pwm: Goal PWM under the policy (885 = 100 %). The obs gets the shaped (= sent) q_cmd.
+        self.soft_start, self.rate_limit, self.policy_pwm = 0.0, 0.0, TORQUE_POLICY
+        self.policy_t0 = None
         self.obs = ObsBuilder(contract)
         self.state = OFF
         self.torque_on = False
@@ -271,6 +305,14 @@ class Runner:
         self.out_dead = False
         self.last_level = (OK, "")
         self.fault_log = []
+        # IMU read in a worker thread, overlapped with the servo SYNC_READ (I2C and the serial port are independent;
+        # both syscalls release the GIL): saves the 1.7 ms IMU read per step. Sampled at the same step start.
+        self.imu_pool = None
+        if imu_thread:
+            from concurrent.futures import ThreadPoolExecutor
+            self.imu_pool = ThreadPoolExecutor(max_workers=1)
+        self.imu_fut = None
+        self.n_health_skip = 0
 
     # ------------------------------------------------------------------ output
     def say(self, msg):
@@ -383,13 +425,16 @@ class Runner:
     def start_policy(self):
         if self.policy is None:
             return self.say("no policy loaded")
-        self.set_torque_limit(TORQUE_POLICY)
+        self.set_torque_limit(self.policy_pwm)
         self.cmd.zero()
         self.cmd.applied = np.zeros(3)
         self.policy.reset()
         self.policy_start = True
         self.a_prev = np.zeros(18)
         self.qcmd_prev_pol = self.c.q_default.copy()
+        self.policy_t0 = None
+        self.q_stand_pol = self.poses.STAND.copy()
+        self.q_sent_pol = self.poses.STAND.copy()
         self.state = POLICY
         self.say("POLICY ON  cmd=%s" % np.round(self.cmd.applied, 3))
 
@@ -531,6 +576,8 @@ class Runner:
             self.on_key(k)
 
         # ---- reads
+        if self.imu_pool is not None and (self.imu_fut is None or self.imu_fut.done()):
+            self.imu_fut = self.imu_pool.submit(self.imu.read)  # a stuck read is never queued twice
         raw = self.bus.read_positions(self.ids)
         valid = np.array([r is not None for r in raw])
         q_raw = np.array([r if r is not None else 0.0 for r in raw])
@@ -545,7 +592,7 @@ class Runner:
         if self.reader_init:
             self.reader.update(q_raw, valid)
         try:
-            a_raw, w_raw = self.imu.read()
+            a_raw, w_raw = self.read_imu()
             self.x9 = self.blk.update(a_raw, w_raw, t)
             self.safety.imu_ok(t)
         except OSError as e:
@@ -582,12 +629,16 @@ class Runner:
             self.q_cmd_last = q_cmd
         self.policy_start = False
         # ---- health (after the command went out; every 2nd step: one servo per read, a full round in 0.72 s)
-        if self.hr_tick % 2 == 0:
+        hv = np.nan  # diagnostics: Present Input Voltage of this step's health read (nan = none / dropped)
+        if self.hr_tick % 2 == 0 and self.clock() - t > HEALTH_LATE_S:
+            self.n_health_skip += 1  # late step (e.g. a read retry): keep the slack, read health next time
+        elif self.hr_tick % 2 == 0:
             sid = self.ids[self.hr % 18]
             self.hr += 1
             h = self.bus.health(sid)
             if h is not None:
                 self.safety.health(sid, *h)
+                hv = h[0]
         self.hr_tick += 1
         dt_c = self.clock() - t
         self.compute.append(dt_c)
@@ -598,9 +649,20 @@ class Runner:
         self.log.row(t=t, state=STATE_CODE[self.state], q=self.reader.q, valid=valid,
                      q_cmd=q_cmd if q_cmd is not None else nan18, a=a if a is not None else nan18,
                      o_p=o_p if o_p is not None else np.full(111, np.nan), cmd=self.cmd.applied, imu9=self.x9,
-                     period=period, compute=dt_c, level=lvl)
+                     period=period, compute=dt_c, level=lvl, hv=hv,
+                     rd=np.array(getattr(self.bus, "last_read_diag", (np.nan,) * 5), dtype=float))
         self.status(t)
         return q_cmd
+
+    def read_imu(self):
+        """-> (a_raw, w_raw) of this step. Raises OSError on a failed or (thread mode) late read."""
+        if self.imu_pool is None:
+            return self.imu.read()
+        from concurrent.futures import TimeoutError as FutTimeout
+        try:  # tick() submitted this step's read (or kept a stuck one, which then times out here again)
+            return self.imu_fut.result(timeout=IMU_WAIT_S)
+        except FutTimeout:
+            raise OSError("IMU read late (> %.0f ms after the servo read)" % (1e3 * IMU_WAIT_S))
 
     def command(self, t):
         """-> (q_cmd or None, a or None, o_p or None) for the current state."""
@@ -625,11 +687,27 @@ class Runner:
             o_p = self.obs.frame(self.reader.q, self.reader.qd, self.reader.mask, self.qcmd_prev_pol, self.a_prev,
                                  self.x9)
             a = self.policy.act(o_p, cmd)
-            q_cmd = self.policy.q_cmd(a)
+            q_cmd = self.shape(self.policy.q_cmd(a), t)
             self.qcmd_prev_pol_check = self.qcmd_prev_pol
             self.a_prev, self.qcmd_prev_pol = a, q_cmd
             return q_cmd, a, o_p
         return None, None, None
+
+    def shape(self, q_cmd, t):
+        """Optional soft start + rate limit on the policy target (no-op when both are off)."""
+        if self.soft_start <= 0 and self.rate_limit <= 0:
+            return q_cmd
+        if self.policy_t0 is None:
+            self.policy_t0 = t
+        if self.soft_start > 0:
+            w = min(1.0, (t - self.policy_t0) / self.soft_start)
+            q_cmd = self.q_stand_pol + w * (q_cmd - self.q_stand_pol)
+        if self.rate_limit > 0:
+            m = self.rate_limit * self.c.dt
+            q_cmd = self.q_sent_pol + np.clip(q_cmd - self.q_sent_pol, -m, m)
+        q_cmd = self.c.clip(q_cmd)
+        self.q_sent_pol = q_cmd
+        return q_cmd
 
     def motion_finished(self):
         after, last = self.after_motion, self.motion_prev_q
@@ -690,10 +768,19 @@ class Runner:
         if not len(c):
             return "no steps"
         return ("steps %d | compute p50 %.1f p99 %.1f max %.1f ms | period p50 %.1f p99 %.1f max %.1f ms | "
-                "dropped reads %.2f %% | faults: %s" % (len(c), np.percentile(c, 50), np.percentile(c, 99), c.max(),
-                                                      np.percentile(p, 50), np.percentile(p, 99), p.max(),
-                                                      100.0 * self.n_drops / max(1, self.n_reads),
-                                                      "; ".join(self.fault_log) or "none"))
+                "dropped reads %.2f %% | health skipped %d | faults: %s%s" % (
+                    len(c), np.percentile(c, 50), np.percentile(c, 99), c.max(), np.percentile(p, 50),
+                    np.percentile(p, 99), p.max(), 100.0 * self.n_drops / max(1, self.n_reads), self.n_health_skip,
+                    "; ".join(self.fault_log) or "none", self.read_order_note()))
+
+    def read_order_note(self):
+        """Servos that broke the SYNC_READ chain (bus.breaks: id -> count), for the summary."""
+        b = getattr(self.bus, "breaks", None)
+        if not b:
+            return ""
+        idx = {int(i): k for k, i in enumerate(self.ids)}
+        top = sorted(b.items(), key=lambda kv: -kv[1])[:4]
+        return " | chain breaks: " + ", ".join("%s (id %d) %.0f" % (self.c.short(idx[i]), i, n) for i, n in top)
 
 
 # ---------------------------------------------------------------------------------------------------- start-up
@@ -735,7 +822,8 @@ def setup_servos(bus, contract, say, kp=KP_AX_MATCH):
         % (kp, TORQUE_SCRIPT))
 
 
-def start_imu(imu, blk, dt, say, tries=3):
+def start_imu(imu, blk, dt, say, tries=3, calib_fallback=False):
+    samples = []
     for k in range(tries):
         samples = []
         for _ in range(100):
@@ -747,6 +835,10 @@ def start_imu(imu, blk, dt, say, tries=3):
             return
         except ValueError as e:
             say("IMU start-up (%d/%d): %s - keep the robot still" % (k + 1, tries, e))
+    if calib_fallback:
+        blk.start_calibrated(samples)
+        say("IMU: NOT still - using the calibrated gyro bias %s (--imu-calib-bias)" % np.round(blk.gyro_bias, 4))
+        return
     raise SystemExit("IMU start-up failed")
 
 
@@ -783,6 +875,15 @@ def main(argv=None):
     ap.add_argument("--fake", action="store_true", help="simulated bus + IMU (dry run)")
     ap.add_argument("--no-policy", action="store_true", help="poses only (no onnxruntime needed)")
     ap.add_argument("--logdir", default=os.path.expanduser("~/hexapod_logs"))
+    ap.add_argument("--soft-start", type=float, default=0.0, help="s: blend policy target from STAND (0 = off)")
+    ap.add_argument("--rate-limit", type=float, default=0.0, help="rad/s cap per joint on q_cmd (0 = off)")
+    ap.add_argument("--policy-pwm", type=int, default=TORQUE_POLICY, help="Goal PWM under the policy (885 = 100 %%)")
+    ap.add_argument("--vx-fine", action="store_true", help="speed steps 0.02/0.03/0.04 below 0.05 + ramped command")
+    ap.add_argument("--cmd-ramp", type=float, default=1.0, help="--vx-fine: s per 0.05 m/s of command change")
+    ap.add_argument("--no-imu-thread", action="store_true",
+                    help="read the IMU after the servos instead of overlapped with the servo read (+1.7 ms per step)")
+    ap.add_argument("--imu-calib-bias", action="store_true",
+                    help="if the start-up stillness check fails (hanging robot), keep the calibrated gyro bias")
     args = ap.parse_args(argv)
     if args.vx_max > 0.2 + 1e-9 or args.wz_max > 0.4 + 1e-9:
         raise SystemExit("caps above the trained range (v_x 0.20, w_z 0.4)")
@@ -817,13 +918,23 @@ def main(argv=None):
     try:
         setup_servos(bus, contract, say, args.kp)
         say("SLEEP pose: %s" % contract.sleep_source)
-        start_imu(imu, blk, contract.dt, say)
+        start_imu(imu, blk, contract.dt, say, calib_fallback=args.imu_calib_bias)
         if not args.no_policy:
             from s1h_policy import S1HPolicy
             policy = S1HPolicy(contract, threads=args.threads)
             say("policy: models/control.onnx (%s, obs %d, W %d)" % (contract.raw["source"]["task_id"],
                                                                     contract.obs_dim, contract.window))
-        runner = Runner(contract, bus, imu, blk, policy, args.vx_max, args.wz_max, out=out, log=log)
+        runner = Runner(contract, bus, imu, blk, policy, args.vx_max, args.wz_max, out=out, log=log,
+                        imu_thread=not args.no_imu_thread)
+        runner.soft_start, runner.rate_limit = args.soft_start, args.rate_limit
+        if args.vx_fine:
+            runner.cmd.fine(ramp_s=args.cmd_ramp)
+            say("speed steps %s m/s, command ramp %.1f s per 0.05 m/s (below 0.05 = untrained)"
+                % (runner.cmd.vx_steps, args.cmd_ramp))
+        runner.policy_pwm = int(np.clip(args.policy_pwm, 100, PWM_FULL))
+        if args.soft_start > 0 or args.rate_limit > 0 or runner.policy_pwm != TORQUE_POLICY:
+            say("command shaping: soft start %.2f s, rate limit %.2f rad/s, policy Goal PWM %d (NOT the sim path)"
+                % (args.soft_start, args.rate_limit, runner.policy_pwm))
         if args.fake:
             orig_tick = runner.tick
 

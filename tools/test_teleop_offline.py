@@ -234,7 +234,7 @@ class StubPolicy:
 class Sim:
     """Runner on a FakeBus + FakeImu with a virtual clock."""
 
-    def __init__(self, policy=None, q0=None):
+    def __init__(self, policy=None, q0=None, imu_thread=False):
         self.t = 100.0
         q0 = C.sleep if q0 is None else q0
         self.bus = ax.FakeBus({int(i): float(q) for i, q in zip(C.ids, q0)}, speed=6.0, dt=DT)
@@ -242,7 +242,8 @@ class Sim:
         self.g = np.array([0.0, 0.0, -1.0])
         self.imu = ht.FakeImu(self.blk, tilt=lambda: self.g)
         self.blk.start([self.imu.read() for _ in range(50)])
-        self.r = ht.Runner(C, self.bus, self.imu, self.blk, policy or StubPolicy(), clock=lambda: self.t, out=None)
+        self.r = ht.Runner(C, self.bus, self.imu, self.blk, policy or StubPolicy(), clock=lambda: self.t, out=None,
+                           imu_thread=imu_thread)
         self.states = []
         self.jump = 0.0
 
@@ -381,6 +382,77 @@ def test_fsm_imu_stale():
     _ends_off(s)
 
 
+def test_fsm_imu_thread():
+    s = Sim(imu_thread=True)
+    s.walk()
+    s.tick(n=50)
+    assert s.r.state == ht.POLICY and s.r.last_level[0] < 2, s.r.last_level
+    s.imu.fail = True  # an OSError inside the worker reaches the runner like a direct read
+    s.tick(n=5)
+    assert s.r.state == ht.SIT and "IMU" in s.r.fault_log[-1], s.r.fault_log
+    s.imu.fail = False
+    _ends_off(s)
+
+
+def test_fsm_imu_thread_stuck_read():
+    import threading
+    s = Sim(imu_thread=True)
+    s.walk()
+    gate = threading.Event()
+    read = s.imu.read
+    s.imu.read = lambda: (gate.wait(), read())[1]  # I2C read hangs
+    s.tick(n=5)
+    assert s.r.state == ht.SIT and "IMU" in s.r.fault_log[-1], s.r.fault_log
+    gate.set()
+    s.imu.read = read
+    _ends_off(s)
+
+
+class ChainBus(ax.DxlBus):
+    """DxlBus with the SYNC_READ chain modelled: an id in `silent` does not answer, nor does any id behind it in the
+    list (each servo waits for the previous one's reply). No serial port."""
+
+    def __init__(self):
+        self.timeout, self.sync_timeout = 0.003, 0.010
+        self.last_error, self.n_tx, self.n_drop, self.n_retry = {}, 0, 0, 0
+        self.order, self.breaks = None, {}
+        self.silent, self.lists = set(), []
+
+    def sync_read(self, ids, addr, n):
+        self.lists.append(list(ids))
+        out = {}
+        for i in ids:
+            if i in self.silent:
+                break
+            out[i] = 2048 + i
+        self.last_sync = (15 * len(out), len(out), 0)
+        self.n_drop += len(ids) - len(out)
+        return out
+
+
+def test_read_order_moves_chain_breaker_last():
+    b = ChainBus()
+    ids = [int(i) for i in C.ids]
+    culprit = ids[15]  # LF tibia (id 9): the 2026-11-11 culprit, 3rd from the end in sim order
+    b.silent = {culprit}
+    first = b.read_positions(ids)
+    assert b.last_read_diag[1] == 15, "chain model: 1st SYNC_READ loses the culprit + the 2 ids behind it"
+    assert [k for k, v in enumerate(first) if v is None] == [15], "the retry asks the culprit last"
+    assert b.order[-1] == culprit and b.last_read_diag[4] == culprit
+    for _ in range(5):
+        q = b.read_positions(ids)
+        assert b.last_read_diag[1] == 17 and b.lists[-1] == [culprit], (b.last_read_diag, b.lists[-1])
+        assert [k for k, v in enumerate(q) if v is None] == [15], q
+    assert all(abs(v - ax.pos_to_rad(2048 + i)) < 1e-12 for v, i in zip(q, ids) if v is not None)
+    b.silent = {ids[2]}  # a second breaker: goes before the first, which stays last
+    for _ in range(3):
+        b.read_positions(ids)
+    assert b.order[-2:] == [ids[2], culprit], b.order[-3:]
+    b.silent = set()
+    assert all(v is not None for v in b.read_positions(ids))
+    return "drops per break 3 -> 1"
+
+
 def test_fsm_fault_during_standup_reverses():
     s = Sim()
     s.tick(n=3)
@@ -488,6 +560,50 @@ def test_command_snapping():
     g.key("w")
     assert g.update(0.1)[0] == 0.05 and g.update(0.21)[0] == 0.075
 
+
+def test_command_fine_ramp():
+    c = ht.Command(C, 0.10, 0.2)
+    c.fine(walk_lo=0.02, ramp_s=1.0)
+    assert c.vx_steps == [0.0, 0.02, 0.03, 0.04, 0.05, 0.075, 0.1], c.vx_steps
+    assert c.update(0.0)[0] == 0.0
+    c.key("w")
+    assert abs(c.update(0.02)[0] - 0.02) < 1e-9, "walking starts at the slowest step, not from 0"
+    for _ in range(5):
+        c.key("w")  # target 0.10
+    v, t = [], 0.02
+    while t < 3.0:
+        t += 0.02
+        v.append(c.update(t)[0])
+    dv = np.diff([0.02] + v)
+    assert dv.max() <= 0.05 * 0.02 / 1.0 + 1e-9 and abs(v[-1] - 0.10) < 1e-9, (dv.max(), v[-1])
+    c.key(" ")
+    assert np.allclose(c.update(t + 0.02), 0), "stop is immediate"
+    c.key("w")
+    c.key("a")
+    assert c.target[1] > 0, "v_y allowed from walk_lo"
+
+
+def test_retry_puts_silent_id_last():
+    bus = ax.DxlBus.__new__(ax.DxlBus)
+    bus.n_tx = bus.n_drop = bus.n_retry = 0
+    bus.order, bus.breaks = None, {}
+    bus.sync_timeout = 0.01
+    asked = []
+
+    def fake_sync_read(ids, addr, n):  # id 16 silent: it and every id after it in the request drop
+        asked.append(list(ids))
+        out = {}
+        for i in ids:
+            if i == 16:
+                break
+            out[i] = 2048
+        bus.last_sync = (15 * len(out), len(out), 0)
+        return out
+    bus.sync_read = fake_sync_read
+    q = bus.read_positions([14, 15, 16, 17, 18])
+    assert asked[1] == [17, 18, 16], asked
+    assert q[3] is not None and q[4] is not None and q[2] is None, q
+    assert bus.last_read_diag[2] == 2, bus.last_read_diag
 
 def test_bus_packets():
     # e-manual Protocol 2.0 ping example for ID 1

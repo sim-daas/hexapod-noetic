@@ -39,6 +39,8 @@ def main():
     ap.add_argument("--with-policy", action="store_true", help="run the ONNX policy each step (runner order: read, "
                     "IMU, infer, write, health every 2nd step)")
     ap.add_argument("--threads", type=int, default=1)
+    ap.add_argument("--imu-thread", action="store_true", help="IMU read in a worker thread, overlapped with the "
+                    "SYNC_READ (as the runner does); 'IMU read' is then the extra wait after the servo read")
     args = ap.parse_args()
     c = Contract()
     bus = dx.DxlBus(args.port, sync_timeout=args.sync_timeout)
@@ -89,12 +91,19 @@ def main():
             a_prev = np.zeros(18)
         reads, health, write, imut, total, infer = [], [], [], [], [], []
         drops = np.zeros(18, dtype=int)
+        pool = None
+        if args.imu_thread and imu is not None:
+            from concurrent.futures import ThreadPoolExecutor
+            pool = ThreadPoolExecutor(max_workers=1)
         nxt = time.monotonic()
         for s in range(args.steps):
             t0 = time.perf_counter()
+            fut = pool.submit(imu.read) if pool is not None else None
             q = bus.read_positions(ids)
             t1 = time.perf_counter()
-            if imu is not None:
+            if fut is not None:
+                fut.result(timeout=0.05)
+            elif imu is not None:
                 imu.read()
             t2 = time.perf_counter()
             ok = np.array([v is not None for v in q])

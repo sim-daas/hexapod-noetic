@@ -5,8 +5,10 @@ Packets:  instruction  FF FF FD 00 id len_l len_h instr params.. crc_l crc_h    
 CRC-16 (poly 0x8005, init 0). Byte stuffing (FF FF FD -> FF FF FD FD) is applied to instruction params; status params
 are never stuffed here because every value we read (positions <= 4095, volts, temps) cannot contain FF FF FD.
 
-Per control step the runner uses one SYNC_READ of Present Position (all 18 replies, ~6 ms) and one SYNC_WRITE of Goal
-Position. A servo whose reply is missing, late or corrupt is a dropped read (None). Only RAM registers are written.
+Per control step the runner uses one SYNC_READ of Present Position (all 18 replies, ~5.3 ms) and one SYNC_WRITE of Goal
+Position. A servo whose reply is missing, late or corrupt is a dropped read (None). A silent servo also silences every id
+behind it in the SYNC_READ list, so read_positions keeps the servos that broke the chain at the end of the list.
+Only RAM registers are written.
 
 Position: q = (pos - 2048) * 2*pi / 4096 (2048 = 0 rad, the Interbotix convention). The observation code re-quantises
 q to the AX-12A tick the sim was trained with (proprio.py).
@@ -138,6 +140,7 @@ class DxlBus:
         self.timeout, self.sync_timeout = timeout, sync_timeout
         self.last_error = {}  # id -> status error byte with the ALERT bit set
         self.n_tx = self.n_drop = self.n_retry = 0
+        self.order, self.breaks = None, {}  # adaptive SYNC_READ order (read_positions)
 
     def close(self):
         try:
@@ -216,37 +219,67 @@ class DxlBus:
         """-> {id: int} for the servos that answered (missing = dropped)."""
         self.n_tx += len(ids)
         self._send(packet(BROADCAST, SYNC_READ, struct.pack("<HH", addr, n) + bytes(ids)))
-        got = parse_status(self._recv_gap((11 + n) * len(ids), self.sync_timeout, GAP_S), n)
+        raw = self._recv_gap((11 + n) * len(ids), self.sync_timeout, GAP_S)
+        got = parse_status(raw, n)
         out = {}
         fmt = "<B" if n == 1 else "<H" if n == 2 else "<i"
+        n_alert = 0
         for i in ids:
             r = got.get(i)
             if r is None:
                 continue
             if r[0] & ALERT:
                 self.last_error[i] = r[0]
+                n_alert += 1
             out[i] = struct.unpack(fmt, r[1])[0]
+        self.last_sync = (len(raw), len(out), n_alert)  # diagnostics: bytes received, replies parsed, alert bits
         self.n_drop += len(ids) - len(out)
         if len(out) < len(ids):
             self.ser.reset_input_buffer()
         return out
 
     # ------------------------------------------------------------------ helpers used by the runner
+    def read_order(self, ids):
+        """SYNC_READ id order: the servos that broke the chain most often go last (stable otherwise)."""
+        if self.order is None or sorted(self.order) != sorted(ids):
+            self.order, self.breaks = list(ids), {}
+        return self.order
+
+    def _chain_broke(self, culprit):
+        b = self.breaks
+        b[culprit] = b.get(culprit, 0.0) + 1.0
+        if b[culprit] > 50.0:  # keep adapting: halve all counts
+            for k in b:
+                b[k] *= 0.5
+        pos = {i: k for k, i in enumerate(self.order)}
+        self.order.sort(key=lambda i: (b.get(i, 0.0), pos[i]))
+
     def read_positions(self, ids):
-        """-> list of rad or None per id (same order as ids). If replies are missing (under load the SYNC_READ chain
-        can break: each servo waits for the previous one's reply, so one garbled packet silences the rest), the
-        missing ids are asked once more in a second, short SYNC_READ."""
-        got = self.sync_read(ids, PRESENT_POSITION, 4)
-        missing = [i for i in ids if i not in got]
+        """-> list of rad or None per id (same order as ids).
+
+        Under load the SYNC_READ chain breaks: each servo answers after the previous id in the list, so one servo
+        that stays silent silences every id behind it (logs 2026-11-11: the missing set is always a suffix of the
+        list). The list is therefore ordered so that the servos which broke the chain most often come last
+        (read_order); a break then costs the culprit alone. The missing ids are asked once more in a second, short
+        SYNC_READ, the culprit last."""
+        order = self.read_order(ids)
+        got = self.sync_read(order, PRESENT_POSITION, 4)
+        rx1, ok1, alert1 = self.last_sync
+        missing = [i for i in order if i not in got]
+        # bytes, replies (1st read), recovered by the retry, alerts, culprit id (0 = none)
+        self.last_read_diag = (rx1, ok1, 0, alert1, 0)
         if missing:
             self.n_retry += 1
             self.n_drop -= len(missing)  # count a read as dropped only if the retry fails too
             self.n_tx -= len(missing)
             t, self.sync_timeout = self.sync_timeout, 0.0015 + 0.0005 * len(missing)
+            retry = missing[1:] + missing[:1]
             try:
-                got.update(self.sync_read(missing, PRESENT_POSITION, 4))
+                got.update(self.sync_read(retry, PRESENT_POSITION, 4))
             finally:
                 self.sync_timeout = t
+            self.last_read_diag = (rx1, ok1, sum(i in got for i in missing), alert1, missing[0])
+            self._chain_broke(missing[0])
         return [pos_to_rad(got[i]) if i in got and 0 <= got[i] <= 4095 else None for i in ids]
 
     def write_goals(self, ids, q):

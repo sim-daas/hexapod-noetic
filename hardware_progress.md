@@ -333,3 +333,89 @@ depend on its result.
 5. Optional, only if (1) walks: one low obstacle (≈ 3 cm board) at 0.10 m/s, as a first look at terrain transfer.
 
 Results go into this file as a dated entry (commands, log directories, numbers), then into hexasim's XL430 migration notes.
+
+## 2026-11-11: Policy jitter diagnosed (hung tests + sim comparison) and deploy-side command shaping
+
+Pi now at 192.168.0.106 (tunnel unchanged). Checkpoint: S1H4 B0 `s1h4x_B0_seed43/model_10998.pt`. All tests hung in a harness unless
+noted. Logs in `~/hexapod_logs/`: `2026-11-11_09-43-52` (hung, no shaping), `2026-11-11_10-00-32` (hung, 2 onsets, voltage + read
+diagnostics), `2026-11-11_11-46-14` (run A), `2026-11-11_11-58-00` (run B). Sim runs: `tools/sim/sim_onset.py` (hexasim env, 64 envs, flat).
+
+### What the jitter is
+- **It is the policy's own action chatter, and in sim it is worse.** Standing at cmd 0 (t = 2–5 s), band 6–25 Hz:
+
+  | | joint rms | action rms | accel std | gyro std |
+  |---|---|---|---|---|
+  | robot, floor 11-06 (after onset) | 0.0011 rad | 0.0026 | 0.10 m/s² | 0.014 rad/s |
+  | sim, same checkpoint | 0.0135 rad | 0.063 | 4.8 m/s² | 0.080 rad/s |
+
+  At policy onset (first 25 steps), max |Δa| per step: robot 0.18 (floor) / 0.12 (hung), sim 0.49 for both the training reset (±0.25 rad)
+  and a zero-offset reset. The sim looks smooth because the AX-12A model (dead zone, compliance slope, speed cap ≈ 0.07 rad/step)
+  and PhysX absorb it. In walking at 0.05 m/s the sim policy commands jumps of 0.24 rad/step at p99, while its joints move ≤ 0.068.
+  The only smoothness term in training is `action_rate_l2` at weight −0.01 (no stage overrides it).
+- **Hung and floor onsets match** (first action RF femur +0.42 vs +0.36, LB tibia −0.37 vs −0.35), so foot friction / contact is not
+  the cause. The observation pipeline was already ruled out on 11-06 (replay matches to 7.7e-7, again 9.5e-7 today). IMU noise is in
+  the training range (sim noise acc 0.05 m/s², gyro 0.02 rad/s). Freezing the IMU inputs offline removes only ~25 % of the 3 Hz dither.
+- After onset the robot settles into a slow sway (0.1–1 Hz, middle coxas ~5° peak-to-peak) plus sub-tick dither. The left-back femur
+  and tibia sit 0.08 rad behind their command (foot pressed into the floor, about half PWM).
+
+### Why the policy faults (22 % dropped reads)
+- The burst steps (Δq_cmd 0.05–0.2 rad) make one servo stop answering the SYNC_READ, most often LF tibia (sim idx 15), sometimes idx 8,
+  9 or 13. Every later id in the read waits for it and drops too. The bytes received are always an exact multiple of 15 (clean replies,
+  then silence): no corrupted packets and no hardware alert bits. The 3 ms retry of the same ids usually also fails. It never
+  happens in STAND or SIT.
+- Voltage: 10.8 V in STAND (11.4–11.6 V on 11-06, so the battery was low), one 9.8 V reading on the first burst step, otherwise
+  10.5–10.9 V. Supply sag is not the main cause. Capping the power (run B) cut the onset drops from ~50 to 4, so the current spikes
+  are what triggers it.
+- New log fields: `hv` (voltage of this step's health read, nan if none) and `rd` (bytes and replies of the first read, ids recovered
+  by the retry, alert count).
+
+### Command shaping (opt-in flags; defaults = the sim-faithful path)
+`--soft-start S` (blend the policy target from STAND over S s), `--rate-limit R` (rad/s cap per joint on q_cmd), `--policy-pwm N`
+(Goal PWM under the policy, 885 = 100 %). The obs gets the shaped (= sent) q_cmd. `--imu-calib-bias`: if the start-up stillness
+check fails (hanging robot), keep the calibrated gyro bias.
+
+| hung run | onset (1 s) | standing cmd 0 | walking v_x 0.05 |
+|---|---|---|---|
+| none | Δq_cmd ≤ 0.13 rad/step, 38–63 drops, fault in 0.5 s | — | — |
+| **A** `--soft-start 1.0 --rate-limit 3.5` | ≤ 0.023 rad/step, **0 drops**, gyro std 0.02 | calm, 0–3 drops | drops on 10/110 (fault) and 42/884 steps |
+| **B** `--policy-pwm 619` | ≤ 0.09 rad/step, 4 drops, jitter still felt | calm, 0 drops | Δq_cmd ≤ 0.21 rad/step, drops on 14/744 steps, no fault |
+
+- User: in A the stand → policy hand-off was smooth with no jitter. Walking at 0.05 felt fast: the legs moved smoothly but suddenly,
+  and the harness swung from the inertia. In B there was jitter at policy on and at stop, and the gait felt slightly jittery at
+  times (the 50 Hz log is calm in the 1 s after stop).
+- While walking the measured joints move faster than the 0.07 rad/step cap (|Δq| p99 0.09–0.10 rad/step): the XL430 overshoots with
+  D 0. The policy steps at 1.5 Hz with fast swings in sim too. Hung walking is not representative: the legs are unloaded and the
+  kinematic velocity estimate has no ground contact.
+- Speeds below 0.05 m/s (the trained minimum) in sim: cmd 0.025 → 0.021 ± 0.010 m/s achieved (0.05 → 0.047), same 1.5 Hz step rate,
+  shorter strides, swing just as fast.
+
+### Next
+- Robot: floor test with a charged battery, A shaping + `--policy-pwm 619`, starting at v_x 0.02 with finer speed steps.
+- hexasim (the real fix): a stronger action-rate / smoothness penalty, and the XL430 actuator model so the chatter costs something in
+  training (the servo bench from the 2026-11-11 task list feeds it).
+
+## 2026-11-11 (later): dropped reads are a broken SYNC_READ chain; read order + loop timing fixes (offline, not yet on the robot)
+
+Analysis of all 11-06 / 11-11 logs (`rd` field): in **every** step with a final drop, the missing set is a suffix of the read
+list (sim order). The first missing id (the culprit) is a servo that moves fast at that moment (its own |Δq_cmd| 0.05 rad vs
+median 0.002). It keeps tracking through its drops, so it is not rebooting. The culprits were LF tibia (id 9) most of the time,
+then RM/RB tibia and LF/RB/LM femur. The immediate retry rescued 109 of 165 incomplete reads in run A. When it fails it
+usually gets nothing, not even from the ids behind the culprit that it asks first.
+
+Changes:
+- `dxl_bus.read_positions`: **adaptive read order**. Each servo that breaks the chain moves towards the end of the SYNC_READ
+  list (decayed counts). A break then costs the culprit alone. On the logs: run A 212 → ~56 dropped reads, joints that ever
+  drop 11 → the 4 culprits. The culprit's own drops are unchanged (that is the current-spike problem: shaping, battery).
+  `rd` now has 5 fields (… , culprit id or 0), and the runner summary lists the chain breakers.
+- Loop timing: policy steps were compute p50 16.8 / **p99 20.9 ms** (over the 20 ms period), and 19.6–23 ms on every
+  retry step. Now the IMU read runs in a worker thread overlapped with the SYNC_READ: measured on the Pi −1.65 ms per step
+  (bus-wait stand-in 5.3 ms + IMU: 7.20 → 5.55 ms p50). `--no-imu-thread` turns it off. The health read is skipped on steps
+  that are already 16 ms in.
+- `tools/bus/chain_probe.py` (read-only, torque off, **not run yet, servo power was off**): reproduces the broken chain
+  with a ghost id, measures how long the ids behind it stay deaf (SYNC_READ vs single READ retry), and tests FAST SYNC READ
+  (0x8A, X-series firmware ≥ 45; ours is 45) for time and ghost behaviour. `bus_bench.py --imu-thread` times the overlap.
+
+Higher read rate: it does not help. The policy samples q once per 20 ms (q̇ = 2-step difference, W = 50 window) and a 50 Hz
+checkpoint must run at 50 Hz. Extra reads add no information to the observation, only bus time and exposure. The wins are a
+shorter read (FAST SYNC READ, if the probe confirms) and a cheaper retry. Optional: I2C runs at 100 kHz (`clock-frequency`
+0x186a0). 400 kHz (`dtparam=i2c_arm_baudrate=400000`, reboot) would make the IMU read ~0.5 ms; the thread already hides it.

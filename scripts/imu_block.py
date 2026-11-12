@@ -91,6 +91,13 @@ class ImuBlock:
         self.reset()
         self.u = _unit(self.R @ ((A.mean(0) - self.off) * self.sc))
 
+    def start_calibrated(self, samples):
+        """Fallback when the robot cannot be held still (e.g. hanging): keep the calibrated gyro bias, seed gravity
+        from the mean accel. Bias error = drift since calibration (temperature); for bench tests only."""
+        A = np.array([s[0] for s in samples])
+        self.reset()
+        self.u = _unit(self.R @ ((A.mean(0) - self.off) * self.sc))
+
     def update(self, a_raw, w_raw, t):
         """One control step. t = monotonic seconds. Returns the 9-vector [accel@origin, gyro, projected gravity]."""
         ab, wb = self.body(a_raw, w_raw)
