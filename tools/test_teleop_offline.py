@@ -739,6 +739,39 @@ def test_bus_packets():
         pass
 
 
+def test_health_full_stuffed_reply():
+    """The 23-byte health block has signed fields; a reply containing FF FF FD arrives byte-stuffed and must parse."""
+    import struct
+    pwm, load, vel = -1, -3, -2  # FF FF | FD FF | FE FF FF FF: PWM -1 then load low byte FD -> stuffing
+    params = struct.pack("<hhiiIIHB", pwm, load, vel, 2048, 0, 0, 115, 41)
+    assert b"\xff\xff\xfd" in params
+    stuffed = params.replace(b"\xff\xff\xfd", b"\xff\xff\xfd\xfd")
+    body = bytes([0xFF, 0xFF, 0xFD, 0x00, 7]) + struct.pack("<H", len(stuffed) + 4) + bytes([0x55, 0]) + stuffed
+    pk = body + struct.pack("<H", ax.crc16(body))
+    got = ax.parse_status_stuffed(b"\x00" + pk)
+    assert set(got) == {7} and got[7][1] == params, got
+    v, T, d, l, w = ax.unpack_health(got[7][1])
+    assert (v, T) == (11.5, 41.0) and abs(d + 1 / 885.0) < 1e-12 and abs(l + 0.003) < 1e-12
+    assert abs(w + 2 * ax.VEL_UNIT) < 1e-12
+    assert ax.parse_status(pk, 23) == {}  # the fixed-length parser would have dropped it
+
+
+def test_health_pwm_logged():
+    """Each health read logs the joint index, Present PWM, load and velocity next to the voltage."""
+    s = Sim()
+    s.walk()
+    s.tick(n=60)
+    rows = s.r.log.rows
+    hk, hp, hv = (np.array(rows[k], dtype=float) for k in ("hk", "hp", "hv"))
+    on = np.isfinite(hk)
+    assert on.sum() >= 30 and np.isfinite(hp[on]).all() and np.isfinite(hv[on]).all()
+    assert np.isnan(hp[~on]).all() and (np.abs(hp[on]) <= 1.0).all()
+    assert set(hk[on].astype(int)) == set(range(18)), sorted(set(hk[on].astype(int)))
+    assert np.abs(hp[on]).max() > 0.0  # the policy moves the legs: some joint has a nonzero duty
+    for k in ("hl", "hw"):
+        assert np.isfinite(np.array(rows[k], dtype=float)[on]).all(), k
+
+
 def test_proprio_tick_is_sim_tick():
     """The reader quantises to the tick of the servo model the policy trained on (AX-12A 10-bit or XL430 12-bit)."""
     ticks = {"ax12a": np.radians(300.0) / 1023.0, "xl430": 2.0 * np.pi / 4096.0}

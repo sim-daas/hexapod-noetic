@@ -6,7 +6,7 @@ write is a SYNC_WRITE of each servo's own present position to Goal Position (RAM
 
 Reports per servo: model, firmware, Return Delay, drive/operating mode, position limits vs the contract clip box, PWM
 limit, position PID + feed-forward, profile, voltage, temperature, hardware error. Then times N 50 Hz steps of
-  1 x SYNC_READ Present Position (18)  +  1 x health read  +  IMU read  +  1 x SYNC_WRITE Goal Position
+  1 x SYNC_READ Present Position (18)  +  health read (23 B, 124..146, every 2nd step)  +  IMU read  +  1 x SYNC_WRITE Goal Position
 and prints p50 / p99 / max per part, the dropped-read rate, and the budget left for inference (6.4 ms) at 20 ms.
 """
 import argparse
@@ -118,7 +118,7 @@ def main():
                 bus.write_goals(ids, qa)  # torque is off: only the RAM goal register changes
             t4 = time.perf_counter()
             if s % 2 == 0:
-                bus.health(ids[(s // 2) % 18])
+                bus.health_full(ids[(s // 2) % 18])
             t5 = time.perf_counter()
             reads.append(t1 - t0)
             imut.append(t2 - t1)

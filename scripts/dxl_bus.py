@@ -2,8 +2,9 @@
 
 Packets:  instruction  FF FF FD 00 id len_l len_h instr params.. crc_l crc_h      len = n_params + 3
           status       FF FF FD 00 id len_l len_h 55 error params.. crc_l crc_h   len = n_params + 4
-CRC-16 (poly 0x8005, init 0). Byte stuffing (FF FF FD -> FF FF FD FD) is applied to instruction params; status params
-are never stuffed here because every value we read (positions <= 4095, volts, temps) cannot contain FF FF FD.
+CRC-16 (poly 0x8005, init 0). Byte stuffing (FF FF FD -> FF FF FD FD) is applied to instruction params. Status params
+of positions (<= 4095), volts and temps cannot contain FF FF FD, so parse_status ignores stuffing; the signed
+PWM / load / velocity block of health_full() can, and goes through parse_status_stuffed.
 
 Per control step the runner uses one SYNC_READ of Present Position (all 18 replies, ~5.3 ms) and one SYNC_WRITE of Goal
 Position. A servo whose reply is missing, late or corrupt is a dropped read (None). A silent servo also silences every id
@@ -104,6 +105,44 @@ def parse_status(buf, n):
         else:
             i += 1
     return out
+
+
+def unstuff(p):
+    return p.replace(b"\xff\xff\xfd\xfd", b"\xff\xff\xfd")
+
+
+def parse_status_stuffed(buf):
+    """-> {id: (error, params)} for every valid status packet in buf, length from the header, stuffing removed.
+    Needed for signed reads: e.g. load -1 (FF FF) followed by a velocity byte FD makes the servo insert an extra FD."""
+    out, i = {}, 0
+    while i + 11 <= len(buf):
+        if buf[i:i + 4] != b"\xff\xff\xfd\x00":
+            i += 1
+            continue
+        L = struct.unpack("<H", buf[i + 5:i + 7])[0]
+        end = i + 7 + L
+        if L < 4 or end > len(buf):
+            i += 1
+            continue
+        pk = buf[i:end]
+        if pk[7] == 0x55 and crc16(pk[:-2]) == struct.unpack("<H", pk[-2:])[0]:
+            out[pk[4]] = (pk[8], unstuff(bytes(pk[9:-2])))
+            i = end
+        else:
+            i += 1
+    return out
+
+
+PWM_FULL = 885  # Goal / Present PWM units at 100 % duty
+VEL_UNIT = 0.229 * 2.0 * math.pi / 60.0  # rad/s per Present Velocity unit
+HEALTH_ADDR, HEALTH_N = PRESENT_PWM, 23  # 124..146: PWM, Load, Velocity, Position, VelTraj, PosTraj, Voltage, Temp
+
+
+def unpack_health(p):
+    """23 param bytes from 124 -> (volts, deg C, pwm duty, load, rad/s): duty = Present PWM / 885 (signed),
+    load = Present Load / 1000 (signed fraction of stall torque, the firmware's current-based estimate)."""
+    pwm, load, vel, _pos, _vt, _pt, volt, temp = struct.unpack("<hhiiIIHB", p)
+    return volt / 10.0, float(temp), pwm / float(PWM_FULL), load / 1000.0, vel * VEL_UNIT
 
 
 class BusError(Exception):
@@ -307,6 +346,26 @@ class DxlBus:
         r = self._txrx(dxl_id, READ, struct.pack("<HH", PRESENT_VOLTAGE, 3), 3)
         return None if r is None else (struct.unpack("<H", r[:2])[0] / 10.0, float(r[2]))
 
+    def health_full(self, dxl_id):
+        """-> (volts, deg C, pwm duty, load, rad/s) or None: one 23-byte READ of 124..146 (Present PWM through Present
+        Temperature), ~0.2 ms longer than health(). The reply may be byte-stuffed (signed fields), so it is read by
+        its header length."""
+        self.n_tx += 1
+        self._send(packet(dxl_id, READ, struct.pack("<HH", HEALTH_ADDR, HEALTH_N)))
+        buf = self._recv(11 + HEALTH_N, self.timeout)
+        if len(buf) >= 7 and buf[:4] == b"\xff\xff\xfd\x00":
+            need = 7 + struct.unpack("<H", buf[5:7])[0] - len(buf)  # stuffed reply: a few bytes longer
+            if 0 < need <= 8:
+                buf += self._recv(need, self.timeout)
+        r = parse_status_stuffed(buf).get(dxl_id)
+        if r is None or len(r[1]) != HEALTH_N:
+            self.n_drop += 1
+            self.ser.reset_input_buffer()
+            return None
+        if r[0] & ALERT:
+            self.last_error[dxl_id] = r[0]
+        return unpack_health(r[1])
+
     def hw_error(self, dxl_id):
         return self.read(dxl_id, HW_ERROR, 1)
 
@@ -401,6 +460,19 @@ class FakeBus:
 
     def health(self, i):
         return None if self.dead else (self.volts, self.temp)
+
+    def health_full(self, i):
+        """P-only estimate of the duty from the goal error (gain of regs[POS_P]), capped at Goal PWM."""
+        if self.dead:
+            return None
+        if not self.on[i]:
+            return self.volts, self.temp, 0.0, 0.0, 0.0
+        cap = self.pwm[i] / float(PWM_FULL)
+        duty = (self.goal[i] - self.q[i]) / TICK * self.regs[i].get(POS_P, 640) / 128.0 / PWM_FULL
+        duty = max(-cap, min(cap, duty))
+        d = self.goal[i] - self.q[i]
+        vel = 0.0 if abs(d) < 1e-9 else math.copysign(min(self.speed, abs(d) / self.dt), d)
+        return self.volts, self.temp, duty, duty, vel
 
     def hw_error(self, i):
         return 0

@@ -67,7 +67,7 @@ CMD_GATE_S = 0.2
 SIGN_PULSE = 0.15
 ESC = "\x1b"
 IMU_WAIT_S = 0.004  # worker-thread IMU read: give up (= missed IMU sample) after this; a read takes 1.7 ms at 100 kHz
-HEALTH_LATE_S = 0.016  # skip this step's health read (~1.2 ms) if the step has already used this much of its 20 ms
+HEALTH_LATE_S = 0.016  # skip this step's health read (~1.4 ms) if the step has already used this much of its 20 ms
 
 
 def hold(q, seconds, name="hold"):
@@ -646,16 +646,19 @@ class Runner:
             self.q_cmd_last = q_cmd
         self.policy_start = False
         # ---- health (after the command went out; every 2nd step: one servo per read, a full round in 0.72 s)
-        hv = np.nan  # diagnostics: Present Input Voltage of this step's health read (nan = none / dropped)
+        # Diagnostics of this step's health read (nan = none / dropped): hk = sim joint index read, hv = Present Input
+        # Voltage, hp = Present PWM / 885 (signed duty), hl = Present Load / 1000, hw = Present Velocity (rad/s).
+        hk = hv = hp = hl = hw = np.nan
         if self.hr_tick % 2 == 0 and self.clock() - t > HEALTH_LATE_S:
             self.n_health_skip += 1  # late step (e.g. a read retry): keep the slack, read health next time
         elif self.hr_tick % 2 == 0:
-            sid = self.ids[self.hr % 18]
+            k = self.hr % 18
+            sid = self.ids[k]
             self.hr += 1
-            h = self.bus.health(sid)
+            h = self.bus.health_full(sid)
             if h is not None:
-                self.safety.health(sid, *h)
-                hv = h[0]
+                self.safety.health(sid, h[0], h[1])
+                hk, (hv, _, hp, hl, hw) = k, h
         self.hr_tick += 1
         dt_c = self.clock() - t
         self.compute.append(dt_c)
@@ -666,7 +669,8 @@ class Runner:
         self.log.row(t=t, state=STATE_CODE[self.state], q=self.reader.q, valid=valid,
                      q_cmd=q_cmd if q_cmd is not None else nan18, a=a if a is not None else nan18,
                      o_p=o_p if o_p is not None else np.full(111, np.nan), cmd=self.cmd.applied, imu9=self.x9,
-                     period=period, compute=dt_c, level=lvl, hv=hv, duty=self.safety.duty,
+                     period=period, compute=dt_c, level=lvl, hv=hv, hk=hk, hp=hp, hl=hl, hw=hw,
+                     duty=self.safety.duty,
                      rd=np.array(getattr(self.bus, "last_read_diag", (np.nan,) * 5), dtype=float))
         self.status(t)
         return q_cmd

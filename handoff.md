@@ -19,9 +19,8 @@ Session of 2026-11-13 evening / night, driven from the hexasim side. Details: `h
 - **Robot:** the last log (`_14-30-37`) ends with sit-down complete and torque off. Battery was at 10.4–10.9 V under the
   policy — charge it.
 - Start-up latched-alarm check and stall monitor are in the runner and on the Pi (the bench handoff below says otherwise; stale).
-- **Nothing is committed** since `bad2cbe`: bench tools, runner protections, policy tags / clock / slew, the s1xls export.
-  Workstation and Pi trees were synced on 2026-11-13 night; **this handoff is not on the Pi** (tunnel down on 2026-11-14) —
-  rsync per `HARDWARE_ACCESS.md` when it is back.
+- Everything above was committed in `e4cfa5b` (2026-11-14). The Present PWM logging below is not committed yet.
+  **Sync the workstation tree to the Pi before the data session** (rsync per `HARDWARE_ACCESS.md`).
 
 ## What the first runs did NOT give (the reason for a second session)
 
@@ -54,10 +53,13 @@ reads drop. Obstacles are not part of this session (S1 does not train on them).
 
 ## Open work, in order
 
-1. **Runner: log Present PWM while walking** (not started). Cheapest route: widen `dxl_bus.health()` from the 3-byte
-   voltage + temperature read to one read from Present PWM (addr 124) through Present Temperature (146), 23 bytes, still one
-   servo every second step; log PWM, load, velocity beside `hv`. Needs `FakeBus.health` and an offline test, then a timing
-   check on the Pi (`tools/bus/bus_bench.py`). **Do this before the data session if possible** — it is item 3 above.
+1. **Runner: log Present PWM while walking — done offline 2026-11-14, timing on the Pi still to check.**
+   `DxlBus.health_full()` reads 124..146 (23 bytes, stuffing-aware since PWM / load / velocity are signed) in place of
+   the 3-byte voltage + temperature read, still one servo every 2nd step (each joint every 0.72 s). New log columns:
+   `hk` (sim joint index read that step), `hp` (Present PWM / 885, signed), `hl` (Present Load / 1000), `hw` (Present
+   Velocity, rad/s), all nan on steps without a read. `health()` is unchanged for the bench. Tests 40 / 40 (both
+   policies). On the Pi, before the runs: `python3 tools/bus/bus_bench.py --with-policy --threads 2 --imu-thread` (now times `health_full`;
+   expect ≈ +0.2 ms on the health line, step p99 should stay ≲ 16 ms).
 2. Data session (table above), then pull: `rsync -az -e 'ssh -p 2222' pibot@127.0.0.1:hexapod_logs/ ~/hexapod_logs/`.
 3. hexasim: fit `actuators/xl430.py` on the bench logs + the 0.05 m/s walking logs, test by replaying the logged `q_cmd`
    through the sim robot (tool not written), and use the 0.10 / 0.15 / turn runs as held-out data.
