@@ -27,7 +27,8 @@ C = Contract()
 K = LegKin(C.kin)
 P = Poses(C)
 DT = C.dt
-REF = os.path.join(REPO, "models", "parity_ref.npz")
+REF = os.path.join(C.model_dir, "parity_ref.npz")  # policy = HEXAPOD_POLICY (default s1h4)
+MAX_STEP = C.rate_limit * DT
 
 
 def have_ort():
@@ -150,7 +151,7 @@ def test_sit_reverses_any_point_of_standup():
 
 # ------------------------------------------------------------------------------------------------ proprio + policy
 def _run_reader(ref):
-    r = ProprioReader(18, DT)
+    r = ProprioReader(18, DT, C.tick)
     out = {"q": [], "qd": [], "mask": []}
     for k in range(len(ref["q_true"])):
         if k == 0:
@@ -174,22 +175,24 @@ def test_proprio_parity():
 def test_policy_parity():
     if not have_ort():
         return "skipped (no onnxruntime)"
-    from s1h_policy import ObsBuilder, S1HPolicy
+    from s1h_policy import Clock, ObsBuilder, S1HPolicy, slew
     ref = np.load(REF)
-    pol, ob = S1HPolicy(C), ObsBuilder(C)
+    pol, ob, ck = S1HPolicy(C), ObsBuilder(C), Clock(C)
     a_prev, qcmd_prev = np.zeros(18), C.q_default.copy()
     worst_op = worst_a = 0.0
     for k in range(len(ref["action"])):
         # feed the reference reader output (float32 in torch); the reader itself is tested above
-        o_p = ob.frame(ref["q"][k], ref["qd"][k], ref["mask"][k], qcmd_prev, a_prev, ref["imu9"][k])
+        o_p = ob.frame(ref["q"][k], ref["qd"][k], ref["mask"][k], qcmd_prev, a_prev, ref["imu9"][k],
+                       ck.frame(ref["cmd"][k]))
         worst_op = max(worst_op, np.abs(o_p - ref["o_p"][k]).max())
         a = pol.act(o_p, ref["cmd"][k])
         worst_a = max(worst_a, np.abs(a - ref["action"][k]).max())
-        q_cmd = pol.q_cmd(a)
+        q_cmd = pol.q_cmd(a) if MAX_STEP <= 0 else slew(pol.q_cmd(a), qcmd_prev, MAX_STEP)
+        assert np.abs(q_cmd - ref["q_cmd"][k]).max() < 1e-4
         a_prev, qcmd_prev = a, q_cmd
     assert worst_op < 1e-5, worst_op
     assert worst_a < 1e-4, worst_a
-    io = np.load(os.path.join(REPO, "models", "fused_io.npz"))
+    io = np.load(os.path.join(C.model_dir, "fused_io.npz"))
     a = pol.sess.run(["action"], {"hist": io["hist"], "obs_base": io["obs_base"]})[0]
     assert np.abs(a - io["action"]).max() < 1e-5
     return "max |o_p| err %.1e, max |a| err %.1e over %d steps" % (worst_op, worst_a, len(ref["action"]))
@@ -198,17 +201,18 @@ def test_policy_parity():
 def test_policy_end_to_end_with_numpy_reader():
     if not have_ort():
         return "skipped (no onnxruntime)"
-    from s1h_policy import ObsBuilder, S1HPolicy
+    from s1h_policy import Clock, ObsBuilder, S1HPolicy, slew
     ref = np.load(REF)
     rd = _run_reader(ref)
-    pol, ob = S1HPolicy(C), ObsBuilder(C)
+    pol, ob, ck = S1HPolicy(C), ObsBuilder(C), Clock(C)
     a_prev, qcmd_prev = np.zeros(18), C.q_default.copy()
     worst = 0.0
     for k in range(len(ref["action"])):
-        o_p = ob.frame(rd["q"][k], rd["qd"][k], rd["mask"][k], qcmd_prev, a_prev, ref["imu9"][k])
+        o_p = ob.frame(rd["q"][k], rd["qd"][k], rd["mask"][k], qcmd_prev, a_prev, ref["imu9"][k],
+                       ck.frame(ref["cmd"][k]))
         a = pol.act(o_p, ref["cmd"][k])
         worst = max(worst, np.abs(a - ref["action"][k]).max())
-        a_prev, qcmd_prev = a, pol.q_cmd(a)
+        a_prev, qcmd_prev = a, pol.q_cmd(a) if MAX_STEP <= 0 else slew(pol.q_cmd(a), qcmd_prev, MAX_STEP)
     assert worst < 1e-4, worst
     return "max |a| err %.1e" % worst
 
@@ -466,6 +470,113 @@ def test_fsm_fault_during_standup_reverses():
     _ends_off(s)
 
 
+def _pin(sim, k, offset):
+    """Block joint k (sim index) at its present angle + offset: the FakeBus servo no longer follows its goal."""
+    i = int(C.ids[k])
+    q_pin = sim.bus.q[i] + offset
+    adv = sim.bus.advance
+
+    def advance():
+        adv()
+        sim.bus.q[i] = q_pin
+    sim.bus.advance = advance
+    return lambda: setattr(sim.bus, "advance", adv)
+
+
+def test_fsm_stall_fast_tier():
+    s = Sim()
+    s.stand()
+    assert s.r.pwm_cap == ht.TORQUE_SCRIPT and s.r.safety.duty.max() < 0.1, s.r.safety.duty.max()
+    release = _pin(s, 7, 0.13)  # RM femur blocked 0.13 rad off: P law asks 79 %, the 70 % cap holds it
+    n = 0
+    while s.r.state == ht.STAND and n < 200:
+        s.tick()
+        n += 1
+        if n == int(0.75 * sf.STALL_FAST_S / DT):
+            assert s.r.last_level[0] == sf.WARN and "near stall" in s.r.last_level[1], s.r.last_level
+    assert s.r.state == ht.SIT and "stall" in s.r.fault_log[-1] and "idx 7" in s.r.fault_log[-1], s.r.fault_log
+    assert abs(n * DT - sf.STALL_FAST_S) <= 3 * DT, n * DT  # far inside the ~4 s overload trip
+    release()
+    _ends_off(s)
+
+
+def test_fsm_stall_slow_tier_and_no_false_trip():
+    s = Sim()
+    s.stand()
+    release = _pin(s, 13, 0.065)  # RM tibia: 40 % duty, below both tiers -> never a fault
+    s.tick(n=int(8.0 / DT))
+    assert s.r.state == ht.STAND and not s.r.fault_log, (s.r.state, s.r.fault_log)
+    assert abs(s.r.safety.duty[13] - 0.065 / ht.sat_err(ht.KP_AX_MATCH)) < 0.04, s.r.safety.duty[13]
+    release()
+    s.tick(n=5)
+    release = _pin(s, 13, 0.085)  # 52 %: the slow tier only
+    n = 0
+    while s.r.state == ht.STAND and n < 400:
+        s.tick()
+        n += 1
+    assert s.r.state == ht.SIT and ">= 45 %" in s.r.fault_log[-1], s.r.fault_log
+    assert abs(n * DT - sf.STALL_SLOW_S) <= 3 * DT, n * DT
+    release()
+    _ends_off(s)
+
+
+def test_stall_monitor_unit():
+    m = sf.Safety(18, DT)
+    m.imu_ok(0.0)
+    m.sat_err = ht.sat_err(ht.KP_AX_MATCH)
+    assert abs(m.sat_err - 0.1638) < 1e-3, m.sat_err
+    q, g, ok = np.zeros(18), np.array([0, 0, -1.0]), np.ones(18, bool)
+    cmd = np.zeros(18)
+    cmd[3] = 0.5  # asks 305 %: the estimate is clipped at the cap
+
+    def run(steps, cap, valid=ok, c=cmd, t0=0.0):
+        lvl = None
+        for k in range(steps):
+            m.imu_ok(t0 + k * DT)
+            lvl = m.step(t0 + k * DT, valid, q, c, g, DT, True, cap=cap)
+        return lvl
+    assert run(1, 1.0)[0] == sf.OK and abs(m.duty[3] - 1.0) < 1e-9
+    # a 40 % cap is below both tiers (30 % never tripped on the bench): no stall fault however long
+    m.stall_t[:] = 0
+    lvl = run(600, 0.40)
+    assert "stall" not in lvl[1], lvl
+    # dropped reads neither advance nor reset the timer
+    m.stall_t[:] = 0
+    drop = ok.copy()
+    drop[3] = False
+    run(20, 1.0)
+    held = m.stall_t[0][3]
+    run(100, 1.0, valid=drop)
+    assert m.stall_t[0][3] == held, (m.stall_t[0][3], held)
+    # the error going away resets it; torque off resets it; no sat_err = monitor off
+    run(1, 1.0, c=np.zeros(18))
+    assert m.stall_t.max() == 0
+    run(20, 1.0)
+    m.step(0.0, ok, q, cmd, g, DT, False, cap=1.0)
+    assert m.stall_t.max() == 0 and m.duty.max() == 0
+    m.sat_err = None
+    assert "stall" not in run(200, 1.0)[1]
+
+
+def test_setup_refuses_latched_alarm():
+    bus = ax.FakeBus({int(i): float(q) for i, q in zip(C.ids, C.sleep)})
+    bus.hw_error = lambda i: 0x20 if i == 2 else 0
+    try:
+        ht.setup_servos(bus, C, lambda m: None)
+        raise AssertionError("a latched overload must refuse the start")
+    except SystemExit as e:
+        assert "LB femur" in str(e) and "overload" in str(e) and "--clear" in str(e), str(e)
+    assert ax.POS_P not in bus.regs[1] or bus.regs[1][ax.POS_P] != ht.KP_AX_MATCH  # refused before any RAM write
+    bus.hw_error = lambda i: None if i == 9 else 0
+    try:
+        ht.setup_servos(bus, C, lambda m: None)
+        raise AssertionError("an unreadable alarm register must refuse the start")
+    except SystemExit as e:
+        assert "not readable" in str(e), str(e)
+    bus.hw_error = lambda i: 0x80 if i == 4 else 0  # a bit outside ALARM_MASK is not a latched shutdown
+    ht.setup_servos(bus, C, lambda m: None)
+
+
 def test_fsm_bus_dead_kills():
     s = Sim()
     s.walk()
@@ -629,8 +740,11 @@ def test_bus_packets():
 
 
 def test_proprio_tick_is_sim_tick():
-    import proprio
-    assert abs(proprio.TICK - C.tick) < 1e-15
+    """The reader quantises to the tick of the servo model the policy trained on (AX-12A 10-bit or XL430 12-bit)."""
+    ticks = {"ax12a": np.radians(300.0) / 1023.0, "xl430": 2.0 * np.pi / 4096.0}
+    assert abs(C.tick - ticks[C.servo.get("model", "ax12a")]) < 1e-15, C.tick
+    s = Sim()
+    assert s.r.reader.tick == C.tick and s.r.rate_limit == C.rate_limit
 
 
 def test_setup_servos_fake():

@@ -1,0 +1,59 @@
+{
+ "source": "~/hexapod_logs/2026-11-11_13-01-51.npz, POLICY state (S1H4 B0 model_10998, cmd 0), mean q_cmd over the last 100 steps (2 s) before the id 2 overload; written by the bench session 2026-11-12",
+ "q_cmd": {
+  "right_front_coxa": -0.0129,
+  "right_middle_coxa": 0.5772,
+  "right_back_coxa": 0.0894,
+  "left_front_coxa": -0.0488,
+  "left_middle_coxa": -0.6229,
+  "left_back_coxa": 0.0473,
+  "right_front_femur": 0.8553,
+  "right_middle_femur": 0.9406,
+  "right_back_femur": 0.8721,
+  "left_front_femur": 0.9461,
+  "left_middle_femur": 0.9362,
+  "left_back_femur": 0.8681,
+  "right_front_tibia": 0.4501,
+  "right_middle_tibia": 0.4474,
+  "right_back_tibia": 0.4597,
+  "left_front_tibia": 0.4336,
+  "left_middle_tibia": 0.5114,
+  "left_back_tibia": 0.4618
+ },
+ "q_meas": {
+  "right_front_coxa": -0.0051,
+  "right_middle_coxa": 0.563,
+  "right_back_coxa": 0.0818,
+  "left_front_coxa": -0.0512,
+  "left_middle_coxa": -0.6097,
+  "left_back_coxa": 0.0461,
+  "right_front_femur": 0.778,
+  "right_middle_femur": 0.9366,
+  "right_back_femur": 0.8752,
+  "left_front_femur": 0.9469,
+  "left_middle_femur": 0.9264,
+  "left_back_femur": 0.7473,
+  "right_front_tibia": 0.4248,
+  "right_middle_tibia": 0.4397,
+  "right_back_tibia": 0.4606,
+  "left_front_tibia": 0.4299,
+  "left_middle_tibia": 0.5016,
+  "left_back_tibia": 0.3583
+ },
+ "toe_r_cm": [
+  1.9,
+  0.49,
+  1.51,
+  0.55,
+  -0.12,
+  1.55
+ ],
+ "toe_z_cm": [
+  -17.04,
+  -16.71,
+  -16.92,
+  -16.78,
+  -16.26,
+  -16.92
+ ]
+}

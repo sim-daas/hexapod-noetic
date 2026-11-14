@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Keyboard teleop + safe policy runner for pxmark4 (blind S1H4 B0). One plain-Python process, no ROS. Python 3.8.
+"""Keyboard teleop + safe policy runner for pxmark4 (blind S1-family policies). One plain-Python process, no ROS.
+Python 3.8.
 
     python3 scripts/hexapod_teleop.py               # on the Pi, in the foreground of the SSH session
+    python3 scripts/hexapod_teleop.py --policy s1xls   # another exported policy (config/contract_<tag>.json)
     python3 scripts/hexapod_teleop.py --fake        # dry run with a simulated bus + IMU (any machine)
 
 Keys:
@@ -11,6 +13,8 @@ Keys:
   space  zero command (standing)     f  freeze (hold pose, policy off)     x  torque off now (soft kill)
   c  joint sign check (torque off, lying on the belly)    Esc / Ctrl-C  sit down -> torque off -> exit
 
+The runner refuses to start while any servo has a latched hardware alarm (it would stay limp). A joint held near its
+torque cap (stall, estimated from the position error) is a fault well before the servo's own ~4 s overload shutdown.
 Every fault (safety.py) -> freeze 0.5 s -> back to STAND -> sit -> sleep -> torque off. A fall (tilt > 60 deg) or
 a dead bus -> torque off at once. SIGHUP (SSH drop) and SIGTERM sit down and exit; a `finally` turns torque off.
 Logs: ~/hexapod_logs/<date>_<time>.npz (per step) + .jsonl (events).
@@ -31,11 +35,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import dxl_bus as dx  # noqa: E402
-from joint_map import REPO, Contract  # noqa: E402
+from joint_map import POLICY, REPO, Contract  # noqa: E402
 from poses import Motion, Poses, Segment, joint_ramp  # noqa: E402
 from proprio import ProprioReader  # noqa: E402
 from safety import FAULT, KILL, LEVEL_NAME, OK, WARN, Safety, tilt_deg  # noqa: E402
-from s1h_policy import ObsBuilder  # noqa: E402
+from s1h_policy import Clock, ObsBuilder, slew  # noqa: E402
 
 OFF, STANDUP, STAND, POLICY, RECOVER, SIT, FROZEN, SIGNCHECK, EXIT = (
     "OFF", "STANDUP", "STAND", "POLICY", "RECOVER", "SIT", "FROZEN", "SIGNCHECK", "EXIT")
@@ -46,6 +50,13 @@ TORQUE_SCRIPT, TORQUE_POLICY = int(0.70 * PWM_FULL), PWM_FULL  # 70 % scripted m
 # goal; the X-series position loop gives PWM = (P / 128) * error[XL ticks], full (885) at 0.164 rad = 106.8 XL ticks
 # -> P = 885 * 128 / 106.8 = 1061. I, D, feed-forward 0 and no motion profile: the sim models P-only control.
 KP_AX_MATCH = 1061
+
+
+def sat_err(kp):
+    """Position error (rad) at which the P-only loop asks for 100 % PWM: 0.164 rad at P 1061."""
+    return PWM_FULL / (kp / 128.0) * dx.TICK
+
+
 # "Lying down, legs folded" check before u / c, per joint type (coxa, femur, tibia), rad from the vendor sleep pose.
 # With torque off on the belly the legs relax: measured 2026-11-06 femur up to 0.4 rad and tibia up to 0.85 rad off
 # (the feet rest on the ground and open the knee). The stand-up / sign check first ramp to the exact SLEEP pose.
@@ -263,16 +274,20 @@ class Runner:
         self.log = log or Log("", enabled=False)
         self.ids = [int(i) for i in contract.ids]
         self.poses = Poses(contract)
-        self.reader = ProprioReader(18, contract.dt)
+        self.reader = ProprioReader(18, contract.dt, contract.tick)
         self.reader_init = False
         self.safety = Safety(18, contract.dt)
+        self.safety.sat_err = sat_err(KP_AX_MATCH)  # main() overrides it for --kp
+        self.pwm_cap = TORQUE_SCRIPT  # Goal PWM in force (setup_servos writes TORQUE_SCRIPT), for the stall monitor
         self.cmd = Command(contract, vx_max, wz_max)
-        # Deploy-side command shaping (all off by default = the sim-faithful path). soft_start s: blend the policy
-        # target from STAND to full over this time; rate_limit rad/s: per-joint cap on the q_cmd change per step;
-        # policy_pwm: Goal PWM under the policy (885 = 100 %). The obs gets the shaped (= sent) q_cmd.
-        self.soft_start, self.rate_limit, self.policy_pwm = 0.0, 0.0, TORQUE_POLICY
+        # Command shaping. rate_limit rad/s: per-joint cap on the q_cmd change per step; the default is the contract's
+        # (the slew limit the policy trained with, 0 = none), which is the sim-faithful path. Deploy-side extras, off
+        # by default: soft_start s (blend the policy target from STAND to full over this time) and policy_pwm (Goal
+        # PWM under the policy, 885 = 100 %). The obs gets the shaped (= sent) q_cmd.
+        self.soft_start, self.rate_limit, self.policy_pwm = 0.0, contract.rate_limit, TORQUE_POLICY
         self.policy_t0 = None
         self.obs = ObsBuilder(contract)
+        self.gait_clock = Clock(contract)
         self.state = OFF
         self.torque_on = False
         self.motion = None
@@ -345,6 +360,7 @@ class Runner:
     # ------------------------------------------------------------------ bus helpers
     def set_torque_limit(self, value):
         self.bus.set_pwm(self.ids, value)
+        self.pwm_cap = int(value)
 
     def torque_up(self, q_now):
         """Goal = present pose, 70 % torque limit, torque on."""
@@ -429,6 +445,7 @@ class Runner:
         self.cmd.zero()
         self.cmd.applied = np.zeros(3)
         self.policy.reset()
+        self.gait_clock.reset()
         self.policy_start = True
         self.a_prev = np.zeros(18)
         self.qcmd_prev_pol = self.c.q_default.copy()
@@ -610,7 +627,7 @@ class Runner:
 
         # ---- monitors (on the command the servos were tracking until now)
         lvl, why = self.safety.step(t, valid, self.reader.q, self.q_cmd_last, self.x9[6:9], period, self.torque_on,
-                                    alarm)
+                                    alarm, cap=self.pwm_cap / float(PWM_FULL))
         self.last_level = (lvl, why)
         self.last_warn = why if lvl >= WARN else ""
         if lvl >= FAULT:
@@ -649,7 +666,7 @@ class Runner:
         self.log.row(t=t, state=STATE_CODE[self.state], q=self.reader.q, valid=valid,
                      q_cmd=q_cmd if q_cmd is not None else nan18, a=a if a is not None else nan18,
                      o_p=o_p if o_p is not None else np.full(111, np.nan), cmd=self.cmd.applied, imu9=self.x9,
-                     period=period, compute=dt_c, level=lvl, hv=hv,
+                     period=period, compute=dt_c, level=lvl, hv=hv, duty=self.safety.duty,
                      rd=np.array(getattr(self.bus, "last_read_diag", (np.nan,) * 5), dtype=float))
         self.status(t)
         return q_cmd
@@ -685,7 +702,7 @@ class Runner:
             return self.q_hold.copy(), None, None
         if self.state == POLICY:
             o_p = self.obs.frame(self.reader.q, self.reader.qd, self.reader.mask, self.qcmd_prev_pol, self.a_prev,
-                                 self.x9)
+                                 self.x9, self.gait_clock.frame(cmd))
             a = self.policy.act(o_p, cmd)
             q_cmd = self.shape(self.policy.q_cmd(a), t)
             self.qcmd_prev_pol_check = self.qcmd_prev_pol
@@ -703,8 +720,7 @@ class Runner:
             w = min(1.0, (t - self.policy_t0) / self.soft_start)
             q_cmd = self.q_stand_pol + w * (q_cmd - self.q_stand_pol)
         if self.rate_limit > 0:
-            m = self.rate_limit * self.c.dt
-            q_cmd = self.q_sent_pol + np.clip(q_cmd - self.q_sent_pol, -m, m)
+            q_cmd = slew(q_cmd, self.q_sent_pol, self.rate_limit * self.c.dt)
         q_cmd = self.c.clip(q_cmd)
         self.q_sent_pol = q_cmd
         return q_cmd
@@ -796,6 +812,17 @@ def setup_servos(bus, contract, say, kp=KP_AX_MATCH):
     if wrong:
         raise SystemExit("unexpected servo model on ids %s: %s (expected XL430-W250 = %d)"
                          % (wrong, [models[i] for i in wrong], dx.MODEL_XL430))
+    alarms = []
+    for k, i in enumerate(ids):
+        hw = bus.hw_error(i)
+        if hw is None:
+            raise SystemExit("%s (id %d): Hardware Error Status not readable" % (contract.names[k], i))
+        if hw & dx.ALARM_MASK:
+            alarms.append("%s (id %d): %s" % (contract.short(k), i, dx.errors_str(hw)))
+    if alarms:
+        raise SystemExit("latched hardware alarm on %s. These servos stay limp until rebooted: find the cause, then "
+                         "clear with `python3 tools/bench/servo_bench.py status --clear` and start again"
+                         % "; ".join(alarms))
     for k, i in enumerate(ids):
         n = contract.names[k]
         rd, om = bus.read(i, dx.RETURN_DELAY, 1), bus.read(i, dx.OPERATING_MODE, 1)
@@ -818,7 +845,8 @@ def setup_servos(bus, contract, say, kp=KP_AX_MATCH):
                   bus.write(i, dx.GOAL_PWM, TORQUE_SCRIPT, 2)])
         if not ok:
             raise SystemExit("id %d: RAM setup write not acknowledged" % i)
-    say("servos: 18 x XL430 ping, Return Delay 0, position mode, limits OK; P %d I 0 D 0, no profile, Goal PWM %d"
+    say("servos: 18 x XL430 ping, no latched alarms, Return Delay 0, position mode, limits OK; P %d I 0 D 0, "
+        "no profile, Goal PWM %d"
         % (kp, TORQUE_SCRIPT))
 
 
@@ -876,7 +904,9 @@ def main(argv=None):
     ap.add_argument("--no-policy", action="store_true", help="poses only (no onnxruntime needed)")
     ap.add_argument("--logdir", default=os.path.expanduser("~/hexapod_logs"))
     ap.add_argument("--soft-start", type=float, default=0.0, help="s: blend policy target from STAND (0 = off)")
-    ap.add_argument("--rate-limit", type=float, default=0.0, help="rad/s cap per joint on q_cmd (0 = off)")
+    ap.add_argument("--policy", default=POLICY, help="exported policy tag (config/contract_<tag>.json)")
+    ap.add_argument("--rate-limit", type=float, default=None,
+                    help="rad/s cap per joint on q_cmd (0 = off; default = the slew limit the policy trained with)")
     ap.add_argument("--policy-pwm", type=int, default=TORQUE_POLICY, help="Goal PWM under the policy (885 = 100 %%)")
     ap.add_argument("--vx-fine", action="store_true", help="speed steps 0.02/0.03/0.04 below 0.05 + ramped command")
     ap.add_argument("--cmd-ramp", type=float, default=1.0, help="--vx-fine: s per 0.05 m/s of command change")
@@ -891,7 +921,7 @@ def main(argv=None):
     sys.path.insert(0, HERE)
     from imu_block import ImuBlock, MPU6050
 
-    contract = Contract()
+    contract = Contract(args.policy)
     log = Log(args.logdir)
     blk = ImuBlock(os.path.join(REPO, "config", "imu_calib.json"))
     out = sys.stdout
@@ -922,19 +952,23 @@ def main(argv=None):
         if not args.no_policy:
             from s1h_policy import S1HPolicy
             policy = S1HPolicy(contract, threads=args.threads)
-            say("policy: models/control.onnx (%s, obs %d, W %d)" % (contract.raw["source"]["task_id"],
-                                                                    contract.obs_dim, contract.window))
+            say("policy %s: %s iter %s (obs %d, W %d, tick %.5f rad, clock %s, trained slew limit %.2f rad/s)"
+                % (contract.tag, contract.raw["source"]["task_id"], contract.raw["source"]["iter"], contract.obs_dim,
+                   contract.window, contract.tick, "on" if contract.raw["clock_on"] else "off", contract.rate_limit))
         runner = Runner(contract, bus, imu, blk, policy, args.vx_max, args.wz_max, out=out, log=log,
                         imu_thread=not args.no_imu_thread)
-        runner.soft_start, runner.rate_limit = args.soft_start, args.rate_limit
+        runner.soft_start = args.soft_start
+        if args.rate_limit is not None:
+            runner.rate_limit = args.rate_limit
+        runner.safety.sat_err = sat_err(args.kp)
         if args.vx_fine:
             runner.cmd.fine(ramp_s=args.cmd_ramp)
             say("speed steps %s m/s, command ramp %.1f s per 0.05 m/s (below 0.05 = untrained)"
                 % (runner.cmd.vx_steps, args.cmd_ramp))
         runner.policy_pwm = int(np.clip(args.policy_pwm, 100, PWM_FULL))
-        if args.soft_start > 0 or args.rate_limit > 0 or runner.policy_pwm != TORQUE_POLICY:
-            say("command shaping: soft start %.2f s, rate limit %.2f rad/s, policy Goal PWM %d (NOT the sim path)"
-                % (args.soft_start, args.rate_limit, runner.policy_pwm))
+        if args.soft_start > 0 or runner.rate_limit != contract.rate_limit or runner.policy_pwm != TORQUE_POLICY:
+            say("command shaping: soft start %.2f s, rate limit %.2f rad/s (trained %.2f), policy Goal PWM %d "
+                "(NOT the sim path)" % (args.soft_start, runner.rate_limit, contract.rate_limit, runner.policy_pwm))
         if args.fake:
             orig_tick = runner.tick
 

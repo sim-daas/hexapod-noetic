@@ -1,4 +1,5 @@
-"""Fused control graph for the blind S1H4 policy: hist (1, W, 111) + obs_base (1, 1269) → action (18).
+"""Fused control graph for a blind S1-family policy (S1 1,125-D, S2 / S1H4 1,269-D): hist (1, W, 111) + obs_base
+(1, obs_dim) → action (18). obs_dim is read from the checkpoint's actor.
 
 Exact rewrites of hexasim's inference (verified here against the original modules):
   - TCN evaluated only on its receptive cone of the last time step (same zero padding → identical output).
@@ -33,7 +34,8 @@ ck = torch.load(CK, map_location="cpu", weights_only=False)
 assert ck["s1_state"]["gate_iter"] >= 0, "ê gate closed in this checkpoint"
 W = ck["s1_state"]["window"]
 asd = ck["aux_state_dict"]
-Z0, E0, E1 = 117, 181, 196  # z_p and ê slots in the 1,269-D layout (mdp/layout.py)
+Z0, E0, E1 = 117, 181, 196  # z_p and ê slots, the same in every S1-family layout (mdp/layout.py; asserted by the caller)
+D = ck["actor_state_dict"]["mlp.0.weight"].shape[1]  # actor input width
 
 
 class ConeTCN(nn.Module):
@@ -147,7 +149,7 @@ dv.load_state_dict({k[3:]: v for k, v in asd.items() if k.startswith("dv.")})
 fhat.load_state_dict({k[5:]: v for k, v in asd.items() if k.startswith("fhat.")})
 cone = ConeTCN(full)
 sd = ck["actor_state_dict"]
-actor = MLPModel(TensorDict({"policy": torch.zeros(1, 1269)}, [1]), {"actor": ["policy"]}, "actor", 18, [256, 128, 64],
+actor = MLPModel(TensorDict({"policy": torch.zeros(1, D)}, [1]), {"actor": ["policy"]}, "actor", 18, [256, 128, 64],
                  "elu", True, {"class_name": "GaussianDistribution", "init_std": 1.0})
 actor.load_state_dict(sd)
 fused = Fused(cone, dv, fhat, actor.as_onnx(verbose=False), asd["frame_mean"], asd["frame_std"], asd["q_default"]).eval()
@@ -159,7 +161,7 @@ torch.manual_seed(0)
 worst = {"z": 0.0, "vk": 0.0, "action": 0.0}
 for _ in range(64):
     hist = torch.randn(1, W, 111) * asd["frame_std"] + asd["frame_mean"]
-    obs_base = torch.randn(1, 1269)
+    obs_base = torch.randn(1, D)
     with torch.no_grad():
         hn = (hist - asd["frame_mean"]) / asd["frame_std"]
         z_ref = full(hn)
@@ -178,7 +180,7 @@ print(f"TCN conv position-evaluations: cone {cone.n_cone} vs full {cone.n_full}"
 assert max(worst.values()) < 1e-4
 
 hist = torch.randn(1, W, 111) * asd["frame_std"] + asd["frame_mean"]
-obs_base = torch.randn(1, 1269)
+obs_base = torch.randn(1, D)
 torch.onnx.export(fused, (hist, obs_base), OUT / "control.onnx", input_names=["hist", "obs_base"],
                   output_names=["action"], opset_version=17, dynamo=False)
 with torch.no_grad():

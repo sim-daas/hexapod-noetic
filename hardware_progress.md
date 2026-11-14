@@ -419,3 +419,188 @@ Higher read rate: it does not help. The policy samples q once per 20 ms (q̇ = 2
 checkpoint must run at 50 Hz. Extra reads add no information to the observation, only bus time and exposure. The wins are a
 shorter read (FAST SYNC READ, if the probe confirms) and a cheaper retry. Optional: I2C runs at 100 kHz (`clock-frequency`
 0x186a0). 400 kHz (`dtparam=i2c_arm_baudrate=400000`, reboot) would make the IMU read ~0.5 ms; the thread already hides it.
+
+## 2026-11-12: Floor teleop of 2026-11-11 13:01–13:05, diagnosis (logs only, no robot run)
+
+Logs `~/hexapod_logs/2026-11-11_13-01-51`, `_13-03-14`, `_13-05-01`. Flags: `--soft-start 1.0 --rate-limit 3.5 --policy-pwm 619`.
+Speed steps 0.02–0.05. Analysis script: per-state means of `q`, `q_cmd`, FK of the toes (`leg_ik.LegKin`).
+
+- **The only real overload is the first one.** Session 1, policy at zero command: within 1.5 s the LB femur (id 2) is commanded
+  +0.868 rad and stops at +0.747 (error 0.121 rad), and the LB tibia (id 3) stops 0.104 rad short. Both stay pinned for ≈ 4 s, then
+  id 2 reports `overload` (5.7 s after policy on). At P 1061 a 0.121 rad error asks for 8.29 PWM/pulse × 79 pulses = 655, above the
+  619 Goal PWM cap, so the femur sat at its PWM limit against a planted foot until the protection tripped. In the sim the same
+  checkpoint runs at 885 (it would ask 74 %, unsaturated), and the sim has no overload protection at all.
+- **The later faults are the same alarm, still latched.** The XL430 overload bit (HW error 0x20) latches, turns that servo's torque off,
+  and is cleared only by a Reboot instruction or a power cycle. The sit-down after fault 1 ran with id 2 limp, and the LB tibia (id 3)
+  then lost tracking by 0.94 rad (overloaded carrying the leg alone). The next `u` (same session) and the next session (13-03-14)
+  faulted 10 ms after torque-on with "id 2 overload; id 3 overload", before anything moved. `setup_servos` does not read HW_ERROR and
+  never reboots, so a latched alarm survives a runner restart. Session 3 (power cycled in between) stood up fine and stopped on a
+  10.4 V battery fault 7 s into the policy (STAND 10.8–11.0 V: the battery was low).
+- **The policy's standing pose is less stable than STAND, measurably.** Toe positions by FK (last 2 s of each state):
+
+  | | toe r from the coxa axis (cm) RF RM RB LF LM LB | toe z (cm) | middle toes y | front/back toes x |
+  |---|---|---|---|---|
+  | STAND (q_default) | 6.5 6.7 6.7 6.5 6.4 6.6 | −16.9 … −17.0 | ±16.5 | ±17.1 |
+  | policy, cmd 0 | 3.5 0.6 1.4 0.6 0.1 4.9 | −16.4 … −17.7 | −10.5 / +10.1 | +15.0 / +12.9, −13.4 / −16.1 |
+
+  The policy pulls every toe almost under its hip, so the support polygon shrinks (middle feet 6 cm further in). Its six commanded
+  toes are not coplanar: against the best-fit plane, LB is 2.6 mm and RF 1.6 mm low, while the middle legs are 2.2 / 3.6 mm high
+  (`tools/bench/policy_stance_2026-11-11.json`, measured: LB −6.1, RF −4.9 mm). So the body rests on the RF–LB diagonal, rocks, and
+  LB pushes against the rest (the stalled femur/tibia above). In sim this checkpoint already stands badly (hexasim §2.4.1: standing
+  reward 0.53 vs 1.05 for zero action).
+
+### Runner changes this needs (not made yet)
+- At start-up read HW_ERROR on all 18. If an alarm is latched, report it and offer a Reboot (instruction 0x08), then re-apply the RAM
+  gains (a reboot resets them).
+- A stall monitor: log Present PWM (addr 124) in the health read and WARN → freeze/sit when a joint sits at its Goal PWM cap for
+  > ~1 s, well before the ≈ 4 s it took to trip.
+- After an overload fault, sit down with that leg's other joints at reduced PWM, or just torque off (the limp leg overloads the next).
+
+## 2026-11-12: Servo bench + ground test code for the XL430 motor model (written, offline-tested; not run on the robot yet)
+
+User constraints: no scale or known weight (a sealed drink/food package with its net mass on the label works for the optional
+torque calibration), one leg cannot come off, hung-up tests possible, 15 cm ruler, no bench supply (battery, charged). Allowed:
+switching one servo to PWM mode temporarily, deliberately tripping the overload protection. Battery-sensitive tests run first.
+
+Code: `tools/bench/` — `servo_bench.py` (CLI, tests), `bench_lib.py` (servo layer on `dxl_bus`, recorder, safety, `SimServos`),
+`bench_analysis.py` (per-run summary), `analyze_bench.py` (all runs → `bench_summary.json`, PWM→torque calibration),
+`test_bench_offline.py` (16 tests on a simulated XL430), `policy_stance_2026-11-11.json` (the stance the policy commanded).
+Logs: `~/hexapod_logs/bench/<stamp>_<test>.{npz,json}` — raw samples (one servo at ~0.7–1 kHz, or all 18 at 50 Hz) for hexasim to
+replay and fit, plus the test definition.
+
+Beyond the runner (which writes RAM only), the bench (a) writes Operating Mode (EEPROM 11) of one servo 3 ↔ 16 with its torque off,
+recorded first in `~/hexapod_logs/bench/.pwm_mode_ids.json` and restored at every bench start (the teleop refuses mode ≠ 3 anyway);
+(b) sends REBOOT (0x08) to clear latched alarms, then re-applies P 1061 / I 0 / D 0 / no profile. It reads signed PWM/load/velocity,
+so it parses byte-stuffed status packets (`parse_status_any`; the runner's position-only reads never stuff).
+Aborts: any hardware alert, servo ≥ 65 °C, any voltage < 10.0 V, leaving the motion window; then safe stop (PWM-mode servo back to
+mode 3, torque off).
+
+| order | command | setup | gives (xl430.py) |
+|---|---|---|---|
+| 0 | `servo_bench.py status` | none, torque stays off | battery V, temps, latched alarms (offers reboot), modes |
+| 1 | `servo_bench.py hung` | robot hung, feet clear ≥ 25 cm | in order: **speed** (RF coxa, PWM mode, duty 0.05–1.0, ±0.45 rad window, plug-brake at the edge: ω_nl(V), Coulomb duty, t63) → **step** (RF coxa/femur/tibia, 0.02–0.4 rad, caps 885 and 619: dead time, rise, overshoot, final error) → **sine** (same joints, ±0.05 rad at 0.5–25 Hz, 50 Hz ZOH: gain, lag vs hexasim §2.4.2) → **hold** (RF femur at 7 angles from both sides: leg gravity moment, friction, P-law check) → **drops** (all 18 zig-zag |Δq_cmd| 0–0.2 rad/step: drop rate vs step size) |
+| 2 | `servo_bench.py hold --mass M --mass-label "..."` (optional) | hung, the package hung from the RF toe (string loop) | PWM→torque: τ_stall(V) = M g arm / Δduty vs the run without the mass (refuses > 0.75 N m) |
+| 3 | `servo_bench.py stall --joint LB_femur` | belly on the floor, body held down / weighed | contact search (toe down into the floor, 30 %), then cap:request trials 30:45, 50:75, 70:100, 100:60, 100:130 % up to 40 s: time to the overload alarm; reboot + cool-down between trials |
+| 4 | `servo_bench.py ground` | belly on a flat floor, 40 cm clear | stand-up, STAND 10 s, step one leg at a time into the 2026-11-11 policy stance, hold at Goal PWM 619 and 885, back, lift each tripod 2 cm for 3 s, sit; per-joint static PWM, voltage under load; stall monitor (|PWM| ≥ 92 % of the cap for 0.5 s) ends a hold before the ~4 s overload; tilt > 25° aborts |
+
+Afterwards: `python3 tools/bench/analyze_bench.py` (Pi or workstation after rsync of `~/hexapod_logs/bench`).
+Offline: `python3 tools/bench/test_bench_offline.py` — 16/16 on the workstation; sim checks include ω_nl / Coulomb recovered by the
+speed fit, τ_stall recovered by the mass calibration within 0.2 N m, stall trip timing and reboot, the PWM-mode restore after a crash,
+a latched alarm blocking a start, stuffed packets, the stand-up reversing after a mid-stand-up alarm, the stance leg steps keeping
+the moving toe ≥ 1.5 cm up.
+Known limits: no torque reference without a known mass (then τ_stall stays the datasheet's, and only the duty-unit numbers are
+measured); backlash is invisible to the output-shaft encoder (needs an external reference); hung drops are unloaded legs (the ground
+test logs drops under load); foot friction is not measured.
+
+## 2026-11-13: XL430 bench run on the robot (hung, mass, stall, ground)
+
+All four bench stages ran; logs are in `~/hexapod_logs/bench/` (Pi and workstation), summary in `bench_summary.json`. Details,
+log stems and open issues are in `handoff.md`.
+
+| quantity | measured | conditions |
+|---|---|---|
+| no-load speed | 5.35 rad/s (51 rpm) | RF coxa, PWM mode, ~11.7 V |
+| velocity time constant t63 | ~75 ms | duty ≥ 30 % |
+| friction | static 8–12 % duty, Coulomb ~1.8 % | RF coxa |
+| stall torque | 1.33 N·m (fit r² 0.93) | RF femur, 0.465 kg at the toe, 11.2 V |
+| step response | dead time 13–40 ms, ~20 % overshoot at 0.1–0.2 rad, final error 0.5–7 mrad | RF leg, caps 619 and 885 |
+| frequency response | flat to ~3 Hz, peak ~1.25 near 5 Hz, gone by 12.5 Hz, ~50 ms lag | ±0.05 rad, 50 Hz ZOH |
+| P-law check | measured/predicted 1.014 | hold, no mass |
+| sag under load | 60 mrad at 0.44 N·m | hold with mass |
+| overload trip | none at 30 % (40 s); 15.2 s at 50 %; 7.7 s at 56 %; ~4.2 s from 63 % to 100 % | LB femur stalled on the floor, 39–43 C |
+| read drops (hung) | 0 up to 0.10 rad steps at cap 619; 0.24 % at 0.15 rad; start when V ≤ ~10.5 V; culprits ids 9, 7, 18 | all 18 zig-zag |
+| standing load | STAND: tibia ~14 %, femur ~4 %, coxa ~1.5 % duty; peak 35 % during stand-up | ground test, 11.3 V |
+| policy stance load | LB tibia 27 %, LB femur 21 %, others ≤ 12 %; same at caps 619 and 885 | 2026-11-11 stance |
+| ground test totals | no stall, 0 drops, tilt max 7.2°, V min 10.9 | |
+
+Battery: 11.5 V at rest fell below 10 V with all 18 servos reversing at the 100 % cap, and one stalled femur at 100 % pulled an
+11.6 V pack to 10.7 V. The default stall requests did not saturate the 70 % and 100 % caps (the foot gives 90–130 mrad), so the
+flat ~4.2 s figures come from a rerun with `--trials 0.7:1.6,0.85:1.8,1.0:2.0` and more weight on the body.
+
+Runner changes the same day (offline-tested, not yet run on the robot): `setup_servos` refuses to start on a latched hardware alarm;
+`Safety` has a stall monitor on the duty estimated from the P law (`min(|q_cmd − q| / 0.164, cap)`, no bus read): FAULT at ≥ 60 % for
+1.0 s or ≥ 45 % for 5.0 s. Replayed on `2026-11-11_13-01-51` it faults 2.8 s before the real id 2 overload; on the ground log the
+estimate matches the measured PWM (corr 0.997) and nothing trips.
+
+Next: build hexasim's XL430 actuator model from these logs; reseat the LF connectors.
+
+## 2026-11-13 (evening): S1 XLS exported and on the Pi; test protocol (nothing run on the servos yet)
+
+Decision (user, hexasim session): test the XL430-trained policy on the robot **before** the motor model is refitted or anything
+is retrained; speed from phone video. Checkpoint: hexasim `logs/rsl_rl/hexapod_s1/2026-11-12_09-36-47_s1_xls_seed42/model_7999.pt`
+(`Hexapod-S1-XL430S-v0`, blind, trained on the provisional XL430 model with a 3.5 rad/s command slew limit).
+
+### What changed
+- **Policies are picked by tag.** `tools/policy/export_contract.py <ckpt> <tag>` writes `config/contract_<tag>.json` and
+  `models/<tag>/` (tag `s1h4`, the default, keeps `models/`). The runner takes `--policy <tag>`; tools and tests read
+  `HEXAPOD_POLICY` (default `s1h4`). `export_fused.py` reads the actor width from the checkpoint (1,125 for S1).
+- **Servo tick from the contract.** `ProprioReader(n, dt, tick)`: AX-12A grid for the AX-trained S1H4, 2π/4096 for S1 XLS.
+- **Gait clock** (`s1h_policy.Clock`). S1 keeps the clock (S1H4 dropped it, so the runner had none): f = clamp(v_x / 0.20, 0.8, 2.5)
+  Hz, tripod offsets, all zeros under a zero command; the command of the step that just ended decides, as in the env.
+- **Slew limit from the contract** (`rate_limit` 3.5 rad/s = 0.07 rad per step, `s1h_policy.slew`): on by default for this
+  policy because it trained with it. `--rate-limit` still overrides; `--soft-start` and `--policy-pwm` stay deploy-side extras.
+
+### Checks (all offline)
+- Pi: `HEXAPOD_POLICY=s1xls python3 tools/test_teleop_offline.py` 38 / 38; parity with hexasim's modules, action error 7.9e-6
+  over 120 steps (o_p 7.9e-6). `s1h4` unchanged: 38 / 38, 1.2e-6.
+- Clock and slew against the real env, not a re-implementation: `tools/sim/sim_clock_slew_record.py` (hexasim, 32 envs × 12 s,
+  commands resampled every 2–3 s) → `tools/sim/check_clock_slew.py`: clock error 2.2e-5 over 19,168 steps (138 command changes,
+  2,061 standing steps), sent target 7.4e-8. The slew limit is active on 71 % of the sim steps.
+- hexasim replayed the hung coxa step / sine logs through its XL430 law: the model the policy trained on reproduces them
+  (gain within ≈ 0.1 and lag within 5 ms from 1.5 to 25 Hz; hexasim phase2-progress §2.4.4).
+- Not checked: `tools/bench/test_bench_offline.py` did not finish within 2 min on the workstation today (a copy started by an
+  earlier session is still running). Not looked into.
+
+### Protocol (robot, user present)
+Battery charged (≥ 11.8 V at rest), LF connectors reseated. Start every session with
+`python3 tools/bench/servo_bench.py status`. Runner: `python3 scripts/hexapod_teleop.py --policy s1xls --soft-start 1.0`
+(add `--imu-calib-bias` when hung, `--vx-max 0.15` for the 0.15 m/s runs). Goal PWM under the policy stays 885 (as trained);
+fall back to `--policy-pwm 619` only if reads drop.
+
+1. **Hung**, feet clear: `u`, `p`, zero command 20 s, then `w` to 0.05 / 0.075 / 0.10 for 10 s each, `space`, `p`, `j`.
+   Pass: no fault, legs step as two tripods at ≈ 0.8 Hz, no drops at onset.
+2. **Floor, zero command** 30 s. Note vibration, stall warnings, the stance.
+3. **Floor, walking**: v_x 0.05, 0.10, 0.15; ≥ 3 runs of ≥ 20 s each, tape marks every 0.5 m, phone video from the side.
+4. **Turn on the spot**: `q` / `e` at 0.2 rad/s, one full turn each way.
+5. Optional, only if 3 walks: a ≈ 3 cm board at 0.10 m/s.
+
+Per run: log stem (`~/hexapod_logs/<stamp>`), video file, falls / faults, anything seen. From the logs afterwards: speed against
+video, `q_cmd − q` by joint type in stance and swing, estimated duty, dropped reads and culprits, loop p99, voltage, Σ Δa² —
+each beside the sim's number for the same checkpoint.
+
+## 2026-11-13 (night): first S1 XLS runs on the robot (user at the robot), log analysis
+
+Runner: `--policy s1xls --soft-start 1.0`, slew 3.5 rad/s, Goal PWM 885. Logs `~/hexapod_logs/` (Pi clock): `2026-11-13_14-25-40`
+(hung by the IMU: tilt 7°, 13.5 s at zero command, 6 s at 0.05), `_14-27-13` (floor: 52 s zero command, 14.7 s at 0.05, 2.7 s at
+0.075), `_14-30-37` (floor: 20 s at 0.05; larger joint travel and body acceleration, taken to be the run over the ≈ 5 cm objects —
+not confirmed against the video). **No fault in any session, dropped reads ≤ 0.01 %, loop period p99 20.0 ms (compute p99 17 ms).**
+User: walked on the flat floor; crossed the objects slowly without getting stuck. Speed not measured yet.
+
+**What the logs hold: walking at 0.05 m/s only** (plus 2.7 s at 0.075); no 0.10 / 0.15 and no turn commands.
+
+Same checkpoint in sim (`hexasim logs/eval/xl430/chatter_s1_xls_seed42_v{0.0,0.05}.npz`, 64 envs, flat) against the floor log
+`_14-27-13`, coxa / femur / tibia:
+
+| at 0.05 m/s | sim | robot |
+|---|---|---|
+| step rate (femur spectrum) | 0.80 Hz | 0.77 Hz |
+| joint travel, peak to peak (rad) | 0.49 / 0.75 / 0.77 | 0.48 / 0.81 / 0.89 |
+| tracking error `q_cmd − q`, RMS (mrad) | 42 / 77 / 77 | 61 / 113 / 116 |
+| share of steps with error > 60 % of the saturation error | 0.03 / 0.21 / 0.24 | 0.10 / 0.36 / 0.38 |
+| joint speed p99 (rad/s) | 3.1 / 3.2 / 3.2 | 3.4 / 4.1 / 4.4 |
+| Σ Δa² per step | 0.113 | 0.101 |
+| standing, Σ Δa² per step | 0.0085 | 0.0004 |
+
+- The gait transfers: same step rate and joint travel, no stall fault, standing calmer than in sim.
+- **The real servos track about 45–50 % worse under load and then move faster than the 3.5 rad/s command slew** (catch-up). The
+  sim's model does neither. This, not the unloaded response, is the gap the model fit has to close.
+- The duty in these logs is the runner's estimate from the position error, not Present PWM; it reads 1.00 at p99 during swing,
+  where back-EMF takes most of it. Present PWM was not logged while walking.
+- Voltage 10.4–10.9 V under the policy (battery not full); chain breaks: RM tibia (id 15) 15, RB tibia (id 18) 8, LM tibia 3 over
+  the three sessions, all recovered by the retry.
+- Leg odometry from the logs (the policy's kinematic velocity, stance feet assumed not to slip): 0.043 m/s at 0.05 commanded in
+  both floor sessions, 0.066 at 0.075. An upper estimate until the video is measured. The accelerometer cannot give speed
+  (a 0.05 m/s² bias is 0.5 m/s after 10 s).
+
+Missing for the model: walking at 0.10–0.20 m/s and turning, Present PWM while walking, total robot mass, measured speed.
+
